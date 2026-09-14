@@ -28,7 +28,7 @@ const FILE_IDENTIFIER: u32 = 0x12349876;
 const HEADER_DATA_SIZE: u32 = 28;
 
 const DATA_SIZE: usize = 132;
-const PARTITION_NAM_LENGTH: usize = 32;
+const PARTITION_NAME_LENGTH: usize = 32;
 const FLASH_FILENAME_LENGTH: usize = 32;
 const FOTA_FILENAME_LENGTH: usize = 32;
 
@@ -130,13 +130,13 @@ pub struct PitEntry {
     /// Flash storage media type.
     pub device_type: DeviceType,
     /// Unique identifier for the partition.
-    pub identifier: u32,
+    pub partition_id: u32,
     /// Block/write attributes.
     pub attributes: Attribute,
     /// Update and FOTA attributes.
     pub update_attributes: UpdateAttribute,
     /// Starting block offset or logical block size.
-    pub block_size_or_offset: u32,
+    pub start_block: u32,
     /// Total block count allocated to the partition.
     pub block_count: u32,
     /// Obsolete file offset field.
@@ -144,7 +144,7 @@ pub struct PitEntry {
     /// Obsolete file size field.
     pub file_size: u32,
     /// Name of the partition.
-    pub partition_name: FixedString<PARTITION_NAM_LENGTH>,
+    pub partition_name: FixedString<PARTITION_NAME_LENGTH>,
     /// Target flashing image filename.
     pub flash_filename: FixedString<FLASH_FILENAME_LENGTH>,
     /// FOTA payload package filename.
@@ -178,8 +178,8 @@ pub struct PitData {
     #[br(temp)]
     #[bw(calc = entries.len() as u32)]
     pub entry_count: u32,
-    /// An unknown reference/config string identifier.
-    pub com_tar2: FixedString<8>,
+    /// Device project name / tag (validated by bootloader as "Invalid PIT Project Name").
+    pub project_name: FixedString<8>,
     /// CPU or bootloader target hardware tag.
     pub cpu_bl_id: FixedString<8>,
     /// Logical partition units count.
@@ -225,7 +225,7 @@ impl PitData {
 
     /// Finds a partition entry by its numeric partition identifier.
     pub fn find_entry_by_id(&self, id: u32) -> Option<&PitEntry> {
-        self.entries.iter().find(|e| e.identifier == id)
+        self.entries.iter().find(|e| e.partition_id == id)
     }
 
     /// Packs and serializes the structured PIT representation back into standard binary bytes.
@@ -240,7 +240,7 @@ impl std::fmt::Display for PitData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "--- PIT Header ---")?;
         writeln!(f, "Entry Count: {}", self.entries.len())?;
-        writeln!(f, "Unknown string: {}", self.com_tar2)?;
+        writeln!(f, "Project Name: {}", self.project_name)?;
         writeln!(f, "CPU/bootloader tag: {}", self.cpu_bl_id)?;
         writeln!(f, "Logic unit count: {}", self.lu_count)?;
 
@@ -270,7 +270,7 @@ impl std::fmt::Display for PitData {
                 entry.device_type as u32, device_type_str
             )?;
 
-            writeln!(f, "Identifier: {}", entry.identifier)?;
+            writeln!(f, "Partition ID: {}", entry.partition_id)?;
 
             let mut attr_str = String::new();
             if entry.attributes.stl() {
@@ -307,11 +307,7 @@ impl std::fmt::Display for PitData {
                 update_attributes_u32, update_attr_str
             )?;
 
-            writeln!(
-                f,
-                "Partition Block Size/Offset: {}",
-                entry.block_size_or_offset
-            )?;
+            writeln!(f, "Start Block: {}", entry.start_block)?;
             writeln!(f, "Partition Block Count: {}", entry.block_count)?;
             writeln!(f, "File Offset (Obsolete): {}", entry.file_offset)?;
             writeln!(f, "File Size (Obsolete): {}", entry.file_size)?;

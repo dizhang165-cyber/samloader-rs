@@ -15,10 +15,10 @@
 //! High-fidelity mock transport mimicking the Samsung Odin/Loke download mode protocol
 //! backed by reverse-engineered ground truth from real device bootloaders.
 
-use crate::packets::{
-    RESPONSE_TYPE_DEVICE_INFO, RESPONSE_TYPE_DYNAMIC_PARTITION, RESPONSE_TYPE_END_SESSION,
-    RESPONSE_TYPE_FAIL, RESPONSE_TYPE_FILE_TRANSFER, RESPONSE_TYPE_PIT_FILE,
-    RESPONSE_TYPE_SEND_FILE_PART, RESPONSE_TYPE_SESSION_SETUP, RequestPacket,
+use crate::protocol::{
+    CMD_CLOSE_CONNECTION, CMD_DDP, CMD_DEVINFO, CMD_PIT, CMD_SESSION_INIT, CMD_TRANSMIT,
+    CloseConnectionCommand, Command, DeviceInfoCommand, DynamicPartitionCommand, PitCommand,
+    STATUS_FAIL, STREAMING_CHUNK_ACK, SessionCommand, TransmitCommand,
 };
 use crate::usb::UsbTransfer;
 use binrw::BinRead;
@@ -31,9 +31,9 @@ enum State {
     Uninitialized,
     HandshakeComplete,
     SessionBegun,
-    FileTransferFlash,
-    FileTransferPart,
-    PitFileFlash,
+    TransmitFlash,
+    TransmitSlice,
+    PitFlash,
 }
 
 /// Target hardware, partition table, and protocol characteristics of a simulated Samsung device.
@@ -347,14 +347,14 @@ pub struct MockBackend {
     state: State,
     incoming_buffer: Vec<u8>,
     outgoing_queue: VecDeque<u8>,
-    current_part_index: u32,
+    current_chunk_index: u32,
     packet_size: usize,
     active_pit_data: Vec<u8>,
     parsed_pit: Option<PitData>,
     current_partition_bytes: usize,
     fail_begin_session: Option<i32>,
     fail_commit: Option<i32>,
-    fail_file_part: Option<i32>,
+    fail_chunk: Option<i32>,
     fail_end_session: Option<i32>,
     fail_check_super_size: Option<i32>,
     fail_nand_erase: Option<i32>,
@@ -388,14 +388,14 @@ impl MockBackend {
             state: State::Uninitialized,
             incoming_buffer: Vec::new(),
             outgoing_queue: VecDeque::new(),
-            current_part_index: 0,
+            current_chunk_index: 0,
             packet_size: default_packet,
             active_pit_data: active_pit,
             parsed_pit,
             current_partition_bytes: 0,
             fail_begin_session: None,
             fail_commit: None,
-            fail_file_part: None,
+            fail_chunk: None,
             fail_end_session: None,
             fail_check_super_size: None,
             fail_nand_erase: None,
@@ -445,9 +445,9 @@ impl MockBackend {
         self
     }
 
-    /// Injects an error status on file part chunk receipt.
-    pub fn with_fail_file_part(mut self, status: i32) -> Self {
-        self.fail_file_part = Some(status);
+    /// Injects an error status on chunk receipt.
+    pub fn with_fail_chunk(mut self, status: i32) -> Self {
+        self.fail_chunk = Some(status);
         self
     }
 
@@ -495,7 +495,7 @@ impl UsbTransfer for MockBackend {
         self.state = State::Uninitialized;
         self.incoming_buffer.clear();
         self.outgoing_queue.clear();
-        self.current_part_index = 0;
+        self.current_chunk_index = 0;
         self.packet_size = self.profile.default_packet_size;
     }
 
@@ -531,46 +531,45 @@ impl UsbTransfer for MockBackend {
             }
             State::HandshakeComplete
             | State::SessionBegun
-            | State::FileTransferFlash
-            | State::FileTransferPart
-            | State::PitFileFlash => {
+            | State::TransmitFlash
+            | State::TransmitSlice
+            | State::PitFlash => {
                 // If we are transmitting partition file chunks, consume raw
                 // bytes of `packet_size` size.
-                if self.state == State::FileTransferPart
+                if self.state == State::TransmitSlice
                     && self.incoming_buffer.len() >= self.packet_size
                 {
                     let chunk_size = self.packet_size;
                     if self.verbose {
                         eprintln!(
                             "MockBackend: Received chunk of {} bytes (idx: {})",
-                            chunk_size, self.current_part_index
+                            chunk_size, self.current_chunk_index
                         );
                     }
-                    if let Some(err) = self.fail_file_part {
-                        self.push_response(RESPONSE_TYPE_FAIL, err as u32);
+                    if let Some(err) = self.fail_chunk {
+                        self.push_response(STATUS_FAIL, err as u32);
                     } else {
                         self.current_partition_bytes += chunk_size;
-                        self.push_response(RESPONSE_TYPE_SEND_FILE_PART, self.current_part_index);
-                        self.current_part_index += 1;
+                        self.push_response(STREAMING_CHUNK_ACK, self.current_chunk_index);
+                        self.current_chunk_index += 1;
                     }
                     self.incoming_buffer.drain(..chunk_size);
                     return true;
                 }
 
                 // If we are receiving uploaded PIT bytes
-                if self.state == State::PitFileFlash && !self.incoming_buffer.is_empty() {
+                if self.state == State::PitFlash && !self.incoming_buffer.is_empty() {
                     // Check if the buffer is a 1024-byte control packet or raw PIT binary
                     if self.incoming_buffer.len() >= 1024 {
                         let mut cursor = Cursor::new(&self.incoming_buffer[..1024]);
-                        if let Ok(RequestPacket::PitFile(crate::packets::PitFileRequest::End {
-                            ..
-                        })) = RequestPacket::read_le(&mut cursor)
+                        if let Ok(Command::Pit(PitCommand::End { .. })) =
+                            Command::read_le(&mut cursor)
                         {
                             if !self.active_pit_data.is_empty() {
                                 self.parsed_pit = PitData::new(&self.active_pit_data).ok();
                             }
                             self.state = State::SessionBegun;
-                            self.push_response(RESPONSE_TYPE_PIT_FILE, 0);
+                            self.push_response(CMD_PIT, 0);
                             self.incoming_buffer.drain(..1024);
                             return true;
                         }
@@ -579,22 +578,22 @@ impl UsbTransfer for MockBackend {
                     // Otherwise append raw PIT bytes
                     let raw_bytes = std::mem::take(&mut self.incoming_buffer);
                     self.active_pit_data.extend_from_slice(&raw_bytes);
-                    self.push_response(RESPONSE_TYPE_PIT_FILE, 0);
+                    self.push_response(CMD_PIT, 0);
                     return true;
                 }
 
                 // Parse standard 1024-byte control packets
                 if self.incoming_buffer.len() >= 1024 {
                     let mut cursor = Cursor::new(&self.incoming_buffer[..1024]);
-                    if let Ok(packet) = RequestPacket::read_le(&mut cursor) {
+                    if let Ok(cmd) = Command::read_le(&mut cursor) {
                         if self.verbose {
-                            eprintln!("MockBackend: Received request packet: {:?}", packet);
+                            eprintln!("MockBackend: Received command: {:?}", cmd);
                         }
-                        match packet {
-                            RequestPacket::Session(session_req) => match session_req {
-                                crate::packets::SessionRequest::Begin { protocol_version } => {
+                        match cmd {
+                            Command::Session(session_cmd) => match session_cmd {
+                                SessionCommand::Begin { protocol_version } => {
                                     if let Some(err) = self.fail_begin_session {
-                                        self.push_response(RESPONSE_TYPE_FAIL, err as u32);
+                                        self.push_response(STATUS_FAIL, err as u32);
                                     } else {
                                         self.state = State::SessionBegun;
                                         let negotiated =
@@ -605,47 +604,41 @@ impl UsbTransfer for MockBackend {
                                             0
                                         };
                                         let response_val = (negotiated << 16) | lz4_bit;
-                                        self.push_response(
-                                            RESPONSE_TYPE_SESSION_SETUP,
-                                            response_val,
-                                        );
+                                        self.push_response(CMD_SESSION_INIT, response_val);
                                     }
                                 }
-                                crate::packets::SessionRequest::FilePartSize { size } => {
+                                SessionCommand::PacketSize { size } => {
                                     self.packet_size = size as usize;
-                                    self.push_response(RESPONSE_TYPE_SESSION_SETUP, 0);
+                                    self.push_response(CMD_SESSION_INIT, 0);
                                 }
-                                crate::packets::SessionRequest::SalesCode { .. } => {
-                                    self.push_response(RESPONSE_TYPE_SESSION_SETUP, 0);
+                                SessionCommand::SalesCode { .. } => {
+                                    self.push_response(CMD_SESSION_INIT, 0);
                                 }
-                                crate::packets::SessionRequest::NandErase => {
+                                SessionCommand::NandErase => {
                                     if let Some(err) = self.fail_nand_erase {
-                                        self.push_response(RESPONSE_TYPE_FAIL, err as u32);
+                                        self.push_response(STATUS_FAIL, err as u32);
                                     } else {
                                         self.push_response(
-                                            RESPONSE_TYPE_SESSION_SETUP,
+                                            CMD_SESSION_INIT,
                                             self.nand_erase_sectors,
                                         );
                                     }
                                 }
                                 _ => {
-                                    self.push_response(RESPONSE_TYPE_SESSION_SETUP, 0);
+                                    self.push_response(CMD_SESSION_INIT, 0);
                                 }
                             },
-                            RequestPacket::PitFile(pit_req) => match pit_req {
-                                crate::packets::PitFileRequest::Flash => {
-                                    self.state = State::PitFileFlash;
+                            Command::Pit(pit_cmd) => match pit_cmd {
+                                PitCommand::Flash => {
+                                    self.state = State::PitFlash;
                                     self.active_pit_data.clear();
-                                    self.push_response(RESPONSE_TYPE_PIT_FILE, 0);
+                                    self.push_response(CMD_PIT, 0);
                                 }
-                                crate::packets::PitFileRequest::Dump => {
-                                    self.push_response(
-                                        RESPONSE_TYPE_PIT_FILE,
-                                        self.active_pit_data.len() as u32,
-                                    );
+                                PitCommand::Dump => {
+                                    self.push_response(CMD_PIT, self.active_pit_data.len() as u32);
                                 }
-                                crate::packets::PitFileRequest::Part { part } => {
-                                    let offset = part as usize * 500;
+                                PitCommand::Slice { slice } => {
+                                    let offset = slice as usize * 500;
                                     let end = (offset + 500).min(self.active_pit_data.len());
                                     if offset < self.active_pit_data.len() {
                                         self.outgoing_queue
@@ -653,95 +646,87 @@ impl UsbTransfer for MockBackend {
                                     }
                                 }
                                 _ => {
-                                    self.push_response(RESPONSE_TYPE_PIT_FILE, 0);
+                                    self.push_response(CMD_PIT, 0);
                                 }
                             },
-                            RequestPacket::FileTransfer(transfer_req) => match transfer_req {
-                                crate::packets::FileTransferRequest::Flash
-                                | crate::packets::FileTransferRequest::Lz4Flash => {
-                                    self.state = State::FileTransferFlash;
+                            Command::Transmit(transmit_cmd) => match transmit_cmd {
+                                TransmitCommand::Flash | TransmitCommand::Lz4Flash => {
+                                    self.state = State::TransmitFlash;
                                     self.current_partition_bytes = 0;
-                                    self.push_response(RESPONSE_TYPE_FILE_TRANSFER, 0);
+                                    self.push_response(CMD_TRANSMIT, 0);
                                 }
-                                crate::packets::FileTransferRequest::Part { .. }
-                                | crate::packets::FileTransferRequest::Lz4Part { .. } => {
-                                    self.state = State::FileTransferPart;
-                                    self.current_part_index = 0;
-                                    self.push_response(RESPONSE_TYPE_FILE_TRANSFER, 0);
+                                TransmitCommand::Slice { .. }
+                                | TransmitCommand::Lz4Slice { .. } => {
+                                    self.state = State::TransmitSlice;
+                                    self.current_chunk_index = 0;
+                                    self.push_response(CMD_TRANSMIT, 0);
                                 }
-                                crate::packets::FileTransferRequest::End(_)
-                                | crate::packets::FileTransferRequest::Lz4End(_) => {
+                                TransmitCommand::End(_) | TransmitCommand::Lz4End(_) => {
                                     if let Some(err) = self.fail_commit {
-                                        self.push_response(RESPONSE_TYPE_FAIL, err as u32);
+                                        self.push_response(STATUS_FAIL, err as u32);
                                     } else {
                                         self.current_partition_bytes = 0;
                                         self.state = State::SessionBegun;
-                                        self.push_response(RESPONSE_TYPE_FILE_TRANSFER, 0);
+                                        self.push_response(CMD_TRANSMIT, 0);
                                     }
                                 }
                             },
-                            RequestPacket::EndSession(end_req) => match end_req {
-                                crate::packets::EndSessionRequest::EndSession => {
+                            Command::CloseConnection(close_cmd) => match close_cmd {
+                                CloseConnectionCommand::Close => {
                                     if let Some(err) = self.fail_end_session {
-                                        self.push_response(RESPONSE_TYPE_FAIL, err as u32);
+                                        self.push_response(STATUS_FAIL, err as u32);
                                     } else {
                                         self.state = State::HandshakeComplete;
-                                        self.push_response(RESPONSE_TYPE_END_SESSION, 0);
+                                        self.push_response(CMD_CLOSE_CONNECTION, 0);
                                     }
                                 }
-                                crate::packets::EndSessionRequest::RebootDevice
-                                | crate::packets::EndSessionRequest::RebootDownload => {
+                                CloseConnectionCommand::RebootDevice
+                                | CloseConnectionCommand::RebootDownload => {
                                     self.state = State::Uninitialized;
                                 }
                             },
-                            RequestPacket::DynamicPartition(dp_req) => {
+                            Command::DynamicPartition(dp_cmd) => {
                                 if !self.profile.supports_dynamic_partition {
                                     // S-Boot 4.0 does not recognize Opcode 0x6a -> returns FAIL
-                                    self.push_response(RESPONSE_TYPE_FAIL, 0xffff_ffff);
+                                    self.push_response(STATUS_FAIL, 0xffff_ffff);
                                 } else {
-                                    match dp_req {
-                                        crate::packets::DynamicPartitionRequest::CheckSuperSize {
+                                    match dp_cmd {
+                                        DynamicPartitionCommand::CheckSuperSize {
                                             super_used_size,
                                         } => {
                                             if let Some(err) = self.fail_check_super_size {
-                                                self.push_response(RESPONSE_TYPE_FAIL, err as u32);
+                                                self.push_response(STATUS_FAIL, err as u32);
                                             } else if super_used_size as u64
                                                 > self.profile.super_partition_free_space
                                             {
-                                                self.push_response(RESPONSE_TYPE_FAIL, 0xffff_ffff);
+                                                self.push_response(STATUS_FAIL, 0xffff_ffff);
                                             } else {
-                                                self.push_response(
-                                                    RESPONSE_TYPE_DYNAMIC_PARTITION,
-                                                    0,
-                                                );
+                                                self.push_response(CMD_DDP, 0);
                                             }
                                         }
                                     }
                                 }
                             }
-                            RequestPacket::DeviceInfo(info_req) => {
+                            Command::DeviceInfo(info_cmd) => {
                                 if !self.profile.supports_device_info {
                                     // Opcode 0x69 undefined on legacy bootloaders -> returns FAIL
-                                    self.push_response(RESPONSE_TYPE_FAIL, 0xffff_ffff);
+                                    self.push_response(STATUS_FAIL, 0xffff_ffff);
                                 } else {
-                                    match info_req {
-                                        crate::packets::DeviceInfoRequest::Dump => {
+                                    match info_cmd {
+                                        DeviceInfoCommand::Dump => {
                                             let info = self.profile.binary_device_info();
-                                            self.push_response(
-                                                RESPONSE_TYPE_DEVICE_INFO,
-                                                info.len() as u32,
-                                            );
+                                            self.push_response(CMD_DEVINFO, info.len() as u32);
                                         }
-                                        crate::packets::DeviceInfoRequest::Part { part } => {
+                                        DeviceInfoCommand::Slice { slice } => {
                                             let info = self.profile.binary_device_info();
-                                            let offset = part as usize * 500;
+                                            let offset = slice as usize * 500;
                                             let end = (offset + 500).min(info.len());
                                             if offset < info.len() {
                                                 self.outgoing_queue.extend(&info[offset..end]);
                                             }
                                         }
-                                        crate::packets::DeviceInfoRequest::End => {
-                                            self.push_response(RESPONSE_TYPE_DEVICE_INFO, 0);
+                                        DeviceInfoCommand::End => {
+                                            self.push_response(CMD_DEVINFO, 0);
                                         }
                                     }
                                 }
@@ -803,7 +788,7 @@ mod tests {
         assert!(session.is_lz4_supported());
 
         // 4. Download PIT (Q7MQ_EUR_OPENX.pit is 18492 bytes)
-        let pit_bytes = session.download_pit_file().unwrap();
+        let pit_bytes = session.receive_pit_info().unwrap();
         assert_eq!(pit_bytes.len(), 18492);
         let pit = PitData::new(&pit_bytes).unwrap();
         assert_eq!(pit.cpu_bl_id.to_string_lossy(), "SM8750");
@@ -845,7 +830,7 @@ mod tests {
         assert!(!session.is_lz4_supported());
 
         // 4. Download PIT (M3_EUR_OPEN_4G.pit is 2924 bytes, 20 entries)
-        let pit_bytes = session.download_pit_file().unwrap();
+        let pit_bytes = session.receive_pit_info().unwrap();
         assert_eq!(pit_bytes.len(), 2924);
         let pit = PitData::new(&pit_bytes).unwrap();
         assert_eq!(pit.cpu_bl_id.to_string_lossy(), "Mx-MDM");
@@ -853,7 +838,7 @@ mod tests {
 
         // Verify key partitions from sboot / M3 PIT
         let modem_entry = pit.find_entry_by_name("RADIO").expect("RADIO entry");
-        assert_eq!(modem_entry.identifier, 10);
+        assert_eq!(modem_entry.partition_id, 10);
         assert_eq!(modem_entry.binary_type, BinaryType::ApplicationProcessor);
 
         // 5. In-session DeviceInfo (0x69) is rejected on legacy bootloader

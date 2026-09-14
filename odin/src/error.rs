@@ -78,9 +78,9 @@ pub enum OdinError {
     #[error("Failed to receive packet!")]
     ReceivePacketFailed,
 
-    /// Failed to send a protocol packet.
-    #[error("Failed to send packet!")]
-    SendPacketFailed,
+    /// Failed to send a protocol command.
+    #[error("Failed to send command!")]
+    SendCommandFailed,
 
     /// Packet response type was not what was expected.
     #[error("Response type mismatch! Expected: {expected}, Received: {received}")]
@@ -91,18 +91,18 @@ pub enum OdinError {
         received: u32,
     },
 
-    /// File part index received from device did not match what we expected to send.
-    #[error("Expected file part index: {expected} Received: {received}")]
-    FilePartIndexMismatch {
-        /// The expected file part index.
+    /// Chunk index received from device did not match what we expected to send.
+    #[error("Expected chunk index: {expected} Received: {received}")]
+    ChunkIndexMismatch {
+        /// The expected chunk index.
         expected: usize,
-        /// The actually received file part index.
+        /// The actually received chunk index.
         received: u32,
     },
 
-    /// Failed to receive response for a sent file part block.
-    #[error("Failed to receive file part response!")]
-    FilePartResponseReceiveFailed,
+    /// Failed to receive response for a sent chunk.
+    #[error("Failed to receive chunk response!")]
+    ChunkResponseReceiveFailed,
 
     /// An error reported by the Samsung LOKE bootloader.
     #[error("{0}")]
@@ -262,7 +262,7 @@ pub enum FlashError {
     PartitionNotFound(String),
 
     /// The requested partition ID does not exist in the active PIT table.
-    #[error("Partition identifier {0} does not exist in the specified PIT.")]
+    #[error("Partition ID {0} does not exist in the specified PIT.")]
     PartitionIdNotFound(u32),
 
     /// The file payload is larger than the partition size defined in PIT.

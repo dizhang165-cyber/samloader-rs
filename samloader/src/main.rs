@@ -108,13 +108,13 @@ const PRINT_PIT_ABOUT: &str = "Prints the contents of a PIT file in a human read
 const PRINT_PIT_HELP: &str = r#"Prints the contents of a PIT file in a human readable format. If
 a filename is not provided then Heimdall retrieves the PIT file from the
 connected device"#;
-const PRINT_PIT_FILE_HELP: &str = "The PIT file to print. If not provided, Heimdall retrieves \
+const PRINT_PIT_FILE_HELP: &str = "The PIT file to print. If not provided, samloader retrieves \
                                    the PIT file from the connected device";
 
 // --- Flash Command (`flash`) ---
 const FLASH_ABOUT: &str = "Flashes one or more firmware files to your phone";
 const FLASH_HELP: &str = r#"Flashes one or more firmware files to your phone. Partition names
-(or identifiers) can be obtained by executing the print-pit action.
+(or IDs) can be obtained by executing the print-pit action.
 
 Example explicit flashing: samloader flash -p RECOVERY recovery.img
 Example auto-matching: samloader flash -f boot.img"#;
@@ -131,7 +131,7 @@ const AP_HELP: &str = "AP tar package file";
 const CP_HELP: &str = "CP tar package file";
 const CSC_HELP: &str = "CSC/HOME_CSC tar package file";
 const USERDATA_HELP: &str = "USERDATA tar package file";
-const PARTITION_HELP: &str = "Explicit partition name/identifier and file to flash";
+const PARTITION_HELP: &str = "Explicit partition name/ID and file to flash";
 const FILE_HELP: &str = "Automatic partition name matching file to flash";
 
 // --- Verify MD5 Command (`verify-md5`) ---

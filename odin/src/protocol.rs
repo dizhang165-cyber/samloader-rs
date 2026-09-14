@@ -13,335 +13,377 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Samsung Odin protocol command and streaming wire format definitions.
+//!
+//! # Transfer Architecture: Commands, Slices, and Chunks
+//!
+//! In Samsung's download protocol (`odin4` & `abl_odin.efi` / LOKE), flashing is structured
+//! into three distinct layers:
+//!
+//! 1. **Control Layer ([`Command`] & [`Response`])**:
+//!    Fixed-size 1024-byte command packets sent over USB bulk endpoints to negotiate
+//!    session parameters, query device attributes, and orchestrate transfers. The device
+//!    bootloader replies with an 8-byte response consisting of `(command_echo, value_or_status)`.
+//!
+//! 2. **Flashing Macro Layer (Slices)**:
+//!    Large staging buffers bounded by device RAM (default 30 MB / `0x1E00000` in `odin4`).
+//!    Each slice is announced with a [`TransmitCommand::Slice`] or [`TransmitCommand::Lz4Slice`]
+//!    announcement (rounded up to a 128 KB boundary for raw transfers), streamed in chunks,
+//!    and finally committed to physical storage with [`SliceCommit`] (`0x66`, Subcmd 3 or 7).
+//!    The bootloader verifies and writes the staged RAM buffer to flash before acknowledging.
+//!
+//! 3. **Flashing Micro Layer (Data Chunks - [`DataChunk`])**:
+//!    The physical USB transport units negotiated via [`SessionCommand::PacketSize`]
+//!    (typically 1 MB / `0x100000` on USB 2.0/3.0, or 128 KB on older hardware).
+//!    Chunks are streamed as raw USB bulk packets without zero-length termination packets (ZLPs).
+//!    After each chunk, the bootloader returns a streaming ACK packet `(0x00, chunk_index)`.
+
 use binrw::{BinRead, BinWrite, io::Cursor};
 use samloader_pit::{BinaryType, DeviceType, PitEntry};
 use std::borrow::Cow;
 use std::fmt::Debug;
 
-pub(crate) const RESPONSE_TYPE_SEND_FILE_PART: u32 = 0x00;
-pub(crate) const RESPONSE_TYPE_SESSION_SETUP: u32 = 0x64;
-pub(crate) const RESPONSE_TYPE_PIT_FILE: u32 = 0x65;
-pub(crate) const RESPONSE_TYPE_FILE_TRANSFER: u32 = 0x66;
-pub(crate) const RESPONSE_TYPE_END_SESSION: u32 = 0x67;
-pub(crate) const RESPONSE_TYPE_DEVICE_INFO: u32 = 0x69;
-pub(crate) const RESPONSE_TYPE_DYNAMIC_PARTITION: u32 = 0x6a;
+/// Bootloader streaming ACK opcode (0x00) echoing the received chunk index.
+pub(crate) const STREAMING_CHUNK_ACK: u32 = 0x00;
 
-/// Special opcode returned by Samsung LOKE bootloader indicating an error condition.
-pub(crate) const RESPONSE_TYPE_FAIL: u32 = 0xFFFFFFFF;
+/// Host command opcodes (in Heimdall historically misnamed `RESPONSE_TYPE_*`).
+pub(crate) const CMD_SESSION_INIT: u32 = 0x64;
+pub(crate) const CMD_PIT: u32 = 0x65;
+pub(crate) const CMD_TRANSMIT: u32 = 0x66;
+pub(crate) const CMD_CLOSE_CONNECTION: u32 = 0x67;
+pub(crate) const CMD_DEVINFO: u32 = 0x69;
+pub(crate) const CMD_DDP: u32 = 0x6a;
 
+/// Special status code returned by Samsung LOKE bootloader indicating an error condition.
+pub(crate) const STATUS_FAIL: u32 = 0xFFFFFFFF;
+
+/// Top-level control command sent from host to device over bulk endpoint.
 #[derive(BinRead, BinWrite, Debug)]
 #[brw(little)]
-pub(crate) enum RequestPacket {
+pub(crate) enum Command {
     #[brw(magic = 0x64u32)]
-    Session(SessionRequest),
+    Session(SessionCommand),
 
     #[brw(magic = 0x65u32)]
-    PitFile(PitFileRequest),
+    Pit(PitCommand),
 
     #[brw(magic = 0x66u32)]
-    FileTransfer(FileTransferRequest),
+    Transmit(TransmitCommand),
 
     #[brw(magic = 0x67u32)]
-    EndSession(EndSessionRequest),
+    CloseConnection(CloseConnectionCommand),
 
     #[brw(magic = 0x69u32)]
-    DeviceInfo(DeviceInfoRequest),
+    DeviceInfo(DeviceInfoCommand),
 
     #[brw(magic = 0x6au32)]
-    DynamicPartition(DynamicPartitionRequest),
+    DynamicPartition(DynamicPartitionCommand),
 }
 
+/// Subcommands for [`CMD_SESSION_INIT`] (0x64).
 #[derive(BinRead, BinWrite, Debug)]
 #[brw(little)]
-pub(crate) enum SessionRequest {
+pub(crate) enum SessionCommand {
+    /// Initialize protocol session.
     #[brw(magic = 0u32)]
     Begin { protocol_version: u32 },
+
+    /// Announce total byte count to be flashed across the session.
     #[brw(magic = 2u32)]
     TotalBytes { total_bytes: u64 },
+
+    /// Negotiate streaming USB chunk/packet size (e.g. 1 MB = 0x100000).
     #[brw(magic = 5u32)]
-    FilePartSize { size: u32 },
+    PacketSize { size: u32 },
+
+    /// Triggers an active hardware erase of the `userdata` partition via UEFI EraseBlock
+    /// and returns the device erase sector size.
     #[brw(magic = 7u32)]
     NandErase,
+
+    /// Sets the 3-letter target sales / CSC code.
     #[brw(magic = 9u32)]
     SalesCode { c0: u32, c1: u32, c2: u32 },
 }
 
+/// Subcommands for [`CMD_PIT`] (0x65).
 #[derive(BinRead, BinWrite, Debug)]
 #[brw(little)]
-pub(crate) enum PitFileRequest {
+pub(crate) enum PitCommand {
     #[brw(magic = 0u32)]
     Flash,
     #[brw(magic = 1u32)]
     Dump,
     #[brw(magic = 2u32)]
-    Part { part: u32 },
+    Slice { slice: u32 },
     #[brw(magic = 3u32)]
     End { size: u32 },
 }
 
+/// Subcommands for [`CMD_TRANSMIT`] (0x66).
 #[derive(BinRead, BinWrite, Debug)]
 #[brw(little)]
-pub(crate) enum FileTransferRequest {
+pub(crate) enum TransmitCommand {
     #[brw(magic = 0u32)]
     Flash,
     #[brw(magic = 2u32)]
-    Part { sequence_byte_count: u32 },
+    Slice { slice_byte_count: u32 },
     #[brw(magic = 3u32)]
-    End(FileTransferEnd),
+    End(SliceCommit),
     #[brw(magic = 5u32)]
     Lz4Flash,
     #[brw(magic = 6u32)]
-    Lz4Part {
+    Lz4Slice {
         compressed_size: u32,
         uncompressed_size: u32,
     },
     #[brw(magic = 7u32)]
-    Lz4End(FileTransferEnd),
+    Lz4End(SliceCommit),
 }
 
+/// Descriptor sent to commit and flash a completed slice to physical storage.
 #[derive(BinRead, BinWrite, Debug, PartialEq, Eq)]
 #[brw(little)]
-pub(crate) enum FileTransferEnd {
+pub(crate) enum SliceCommit {
     /// Modern unified layout used by odin4 (bootloader_protocol_version >= 3).
     /// Used for both AP and CP/Modem binaries with magic = 0.
     #[brw(magic = 0u32)]
     Unified {
-        sequence_byte_count: u32,
+        slice_size: u32,
         binary_type: BinaryType,
         device_type: DeviceType,
-        partition_identifier: u32,
-        is_last_sequence: u32,
+        partition_id: u32,
+        is_end_of_file: u32,
     },
     /// Legacy layout used by Odin 3 / Heimdall (bootloader_protocol_version < 3)
     /// when flashing CP / Modem partitions.
     #[brw(magic = 1u32)]
     LegacyModem {
-        sequence_byte_count: u32,
+        slice_size: u32,
         binary_type: BinaryType,
         device_type: DeviceType,
-        is_last_sequence: u32,
+        is_end_of_file: u32,
         reserved: u32,
-        partition_identifier: u32,
+        partition_id: u32,
     },
 }
 
-impl FileTransferEnd {
+impl SliceCommit {
     pub(crate) fn new(
-        sequence_byte_count: u32,
+        slice_size: u32,
         pit_entry: &PitEntry,
-        is_last_sequence: bool,
+        is_end_of_file: bool,
         protocol_version: u32,
     ) -> Self {
-        let is_last_sequence = if is_last_sequence { 1 } else { 0 };
+        let is_end_of_file = if is_end_of_file { 1 } else { 0 };
         if protocol_version >= 3 || pit_entry.binary_type == BinaryType::ApplicationProcessor {
             Self::Unified {
-                sequence_byte_count,
+                slice_size,
                 binary_type: pit_entry.binary_type,
                 device_type: pit_entry.device_type,
-                partition_identifier: pit_entry.identifier,
-                is_last_sequence,
+                partition_id: pit_entry.partition_id,
+                is_end_of_file,
             }
         } else {
             Self::LegacyModem {
-                sequence_byte_count,
+                slice_size,
                 binary_type: pit_entry.binary_type,
                 device_type: pit_entry.device_type,
-                is_last_sequence,
+                is_end_of_file,
                 reserved: 0,
-                partition_identifier: pit_entry.identifier,
+                partition_id: pit_entry.partition_id,
             }
         }
     }
 }
 
+/// Subcommands for [`CMD_CLOSE_CONNECTION`] (0x67).
 #[derive(BinRead, BinWrite, Debug, PartialEq, Eq)]
 #[brw(little)]
-pub(crate) enum EndSessionRequest {
+pub(crate) enum CloseConnectionCommand {
     #[brw(magic = 0u32)]
-    EndSession,
+    Close,
     #[brw(magic = 1u32)]
     RebootDevice,
     #[brw(magic = 2u32)]
     RebootDownload,
 }
 
+/// Subcommands for [`CMD_DEVINFO`] (0x69).
 #[derive(BinRead, BinWrite, Debug, PartialEq, Eq)]
 #[brw(little)]
-pub(crate) enum DeviceInfoRequest {
+pub(crate) enum DeviceInfoCommand {
     #[brw(magic = 0u32)]
     Dump,
     #[brw(magic = 1u32)]
-    Part { part: u32 },
+    Slice { slice: u32 },
     #[brw(magic = 2u32)]
     End,
 }
 
+/// Subcommands for [`CMD_DDP`] (0x6a).
 #[derive(BinRead, BinWrite, Debug, PartialEq, Eq)]
 #[brw(little)]
-pub(crate) enum DynamicPartitionRequest {
+pub(crate) enum DynamicPartitionCommand {
     #[brw(magic = 0u32)]
     CheckSuperSize { super_used_size: u32 },
 }
 
-impl RequestPacket {
+impl Command {
     pub(crate) fn begin_session() -> Self {
-        Self::Session(SessionRequest::Begin {
+        Self::Session(SessionCommand::Begin {
             protocol_version: 0x05,
         })
     }
 
     pub(crate) fn total_bytes(total_bytes: u64) -> Self {
-        Self::Session(SessionRequest::TotalBytes { total_bytes })
+        Self::Session(SessionCommand::TotalBytes { total_bytes })
     }
 
-    pub(crate) fn file_part_size(size: u32) -> Self {
-        Self::Session(SessionRequest::FilePartSize { size })
+    pub(crate) fn packet_size(size: u32) -> Self {
+        Self::Session(SessionCommand::PacketSize { size })
     }
 
     pub(crate) fn nand_erase() -> Self {
-        Self::Session(SessionRequest::NandErase)
+        Self::Session(SessionCommand::NandErase)
     }
 
     pub(crate) fn session_sales_code(code: [u8; 3]) -> Self {
-        Self::Session(SessionRequest::SalesCode {
+        Self::Session(SessionCommand::SalesCode {
             c0: code[0] as u32,
             c1: code[1] as u32,
             c2: code[2] as u32,
         })
     }
 
-    pub(crate) fn end_session() -> Self {
-        Self::EndSession(EndSessionRequest::EndSession)
+    pub(crate) fn close_connection() -> Self {
+        Self::CloseConnection(CloseConnectionCommand::Close)
     }
 
     pub(crate) fn reboot_device() -> Self {
-        Self::EndSession(EndSessionRequest::RebootDevice)
+        Self::CloseConnection(CloseConnectionCommand::RebootDevice)
     }
 
     pub(crate) fn reboot_to_download() -> Self {
-        Self::EndSession(EndSessionRequest::RebootDownload)
+        Self::CloseConnection(CloseConnectionCommand::RebootDownload)
     }
 
-    pub(crate) fn pit_file_flash() -> Self {
-        Self::PitFile(PitFileRequest::Flash)
+    pub(crate) fn pit_flash() -> Self {
+        Self::Pit(PitCommand::Flash)
     }
 
-    pub(crate) fn pit_file_dump() -> Self {
-        Self::PitFile(PitFileRequest::Dump)
+    pub(crate) fn pit_dump() -> Self {
+        Self::Pit(PitCommand::Dump)
     }
 
-    pub(crate) fn pit_file_end() -> Self {
-        Self::PitFile(PitFileRequest::End { size: 0 })
+    pub(crate) fn pit_end() -> Self {
+        Self::Pit(PitCommand::End { size: 0 })
     }
 
-    pub(crate) fn flash_part_pit_file(size: u32) -> Self {
-        Self::PitFile(PitFileRequest::Part { part: size })
+    pub(crate) fn flash_pit_slice(size: u32) -> Self {
+        Self::Pit(PitCommand::Slice { slice: size })
     }
 
-    pub(crate) fn dump_part_pit_file(part: u32) -> Self {
-        Self::PitFile(PitFileRequest::Part { part })
+    pub(crate) fn dump_pit_slice(slice: u32) -> Self {
+        Self::Pit(PitCommand::Slice { slice })
     }
 
-    pub(crate) fn end_pit_file_transfer(size: u32) -> Self {
-        Self::PitFile(PitFileRequest::End { size })
+    pub(crate) fn end_pit_transfer(size: u32) -> Self {
+        Self::Pit(PitCommand::End { size })
     }
 
-    pub(crate) fn file_transfer_flash(lz4: bool) -> Self {
-        Self::FileTransfer(if lz4 {
-            FileTransferRequest::Lz4Flash
+    pub(crate) fn transmit_flash(lz4: bool) -> Self {
+        Self::Transmit(if lz4 {
+            TransmitCommand::Lz4Flash
         } else {
-            FileTransferRequest::Flash
+            TransmitCommand::Flash
         })
     }
 
-    pub(crate) fn flash_part_file_transfer(sequence_byte_count: u32) -> Self {
+    pub(crate) fn start_slice_transmission(slice_byte_count: u32) -> Self {
         // In Samsung LOKE protocol and odin4 (DownloadEngine::transmitData),
-        // the announced raw sequence slice size is rounded up to a 128 KB (0x20000) boundary.
-        let aligned_count = ((sequence_byte_count as u64 + 0x1FFFF) & !0x1FFFF) as u32;
-        Self::FileTransfer(FileTransferRequest::Part {
-            sequence_byte_count: aligned_count,
+        // the announced raw slice size is rounded up to a 128 KB (0x20000) boundary.
+        let aligned_count = ((slice_byte_count as u64 + 0x1FFFF) & !0x1FFFF) as u32;
+        Self::Transmit(TransmitCommand::Slice {
+            slice_byte_count: aligned_count,
         })
     }
 
-    pub(crate) fn flash_part_lz4_file_transfer(
+    pub(crate) fn start_lz4_slice_transmission(
         compressed_size: u32,
         uncompressed_size: u32,
     ) -> Self {
-        Self::FileTransfer(FileTransferRequest::Lz4Part {
+        Self::Transmit(TransmitCommand::Lz4Slice {
             compressed_size,
             uncompressed_size,
         })
     }
 
-    pub(crate) fn end_file_transfer(
-        sequence_byte_count: u32,
+    pub(crate) fn commit_slice(
+        slice_size: u32,
         pit_entry: &PitEntry,
-        is_last_sequence: bool,
+        is_end_of_file: bool,
         lz4: bool,
         protocol_version: u32,
     ) -> Self {
-        let end = FileTransferEnd::new(
-            sequence_byte_count,
-            pit_entry,
-            is_last_sequence,
-            protocol_version,
-        );
-        Self::FileTransfer(if lz4 {
-            FileTransferRequest::Lz4End(end)
+        let commit = SliceCommit::new(slice_size, pit_entry, is_end_of_file, protocol_version);
+        Self::Transmit(if lz4 {
+            TransmitCommand::Lz4End(commit)
         } else {
-            FileTransferRequest::End(end)
+            TransmitCommand::End(commit)
         })
     }
 
     pub(crate) fn check_super_size(super_used_size: u32) -> Self {
-        Self::DynamicPartition(DynamicPartitionRequest::CheckSuperSize { super_used_size })
+        Self::DynamicPartition(DynamicPartitionCommand::CheckSuperSize { super_used_size })
     }
 
     pub(crate) fn device_info_dump() -> Self {
-        Self::DeviceInfo(DeviceInfoRequest::Dump)
+        Self::DeviceInfo(DeviceInfoCommand::Dump)
     }
 
-    pub(crate) fn dump_part_device_info(part: u32) -> Self {
-        Self::DeviceInfo(DeviceInfoRequest::Part { part })
+    pub(crate) fn dump_device_info_slice(slice: u32) -> Self {
+        Self::DeviceInfo(DeviceInfoCommand::Slice { slice })
     }
 
     pub(crate) fn end_device_info() -> Self {
-        Self::DeviceInfo(DeviceInfoRequest::End)
+        Self::DeviceInfo(DeviceInfoCommand::End)
     }
 
     pub(crate) fn expected_response_type(&self) -> u32 {
         match self {
-            Self::Session(_) => RESPONSE_TYPE_SESSION_SETUP,
-            Self::PitFile(_) => RESPONSE_TYPE_PIT_FILE,
-            Self::FileTransfer(_) => RESPONSE_TYPE_FILE_TRANSFER,
-            Self::EndSession(_) => RESPONSE_TYPE_END_SESSION,
-            Self::DeviceInfo(_) => RESPONSE_TYPE_DEVICE_INFO,
-            Self::DynamicPartition(_) => RESPONSE_TYPE_DYNAMIC_PARTITION,
+            Self::Session(_) => CMD_SESSION_INIT,
+            Self::Pit(_) => CMD_PIT,
+            Self::Transmit(_) => CMD_TRANSMIT,
+            Self::CloseConnection(_) => CMD_CLOSE_CONNECTION,
+            Self::DeviceInfo(_) => CMD_DEVINFO,
+            Self::DynamicPartition(_) => CMD_DDP,
         }
     }
 
     pub(crate) fn pack(&self) -> [u8; 1024] {
         let mut buf = [0u8; 1024];
         let mut writer = Cursor::new(&mut buf[..]);
-        self.write_le(&mut writer).expect("Failed to write packet");
+        self.write_le(&mut writer).expect("Failed to write command");
         buf
     }
 }
 
-pub(crate) struct FilePartPacket<'a> {
+/// A micro USB bulk streaming chunk (typically 1 MB = 0x100000 or 128 KB = 0x20000).
+pub(crate) struct DataChunk<'a> {
     buffer: &'a [u8],
     size: usize,
 }
 
-impl<'a> Debug for FilePartPacket<'a> {
+impl<'a> Debug for DataChunk<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FilePartPacket")
+        f.debug_struct("DataChunk")
             .field("data", &format_args!("[u8; {}]", self.size))
             .finish()
     }
 }
 
-impl<'a> FilePartPacket<'a> {
+impl<'a> DataChunk<'a> {
     pub(crate) fn new(buffer: &'a [u8], size: usize) -> Self {
         Self { buffer, size }
     }
@@ -357,6 +399,7 @@ impl<'a> FilePartPacket<'a> {
     }
 }
 
+/// 8-byte response returned by Samsung LOKE bootloader for commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Response {
     pub response_type: u32,
@@ -369,7 +412,7 @@ impl Response {
     pub(crate) fn parse(buffer: &[u8]) -> Result<Self, String> {
         if buffer.len() != Self::SIZE {
             return Err(format!(
-                "Incorrect packet size received - expected size = {}, received size = {}.",
+                "Incorrect response size received - expected size = {}, received size = {}.",
                 Self::SIZE,
                 buffer.len()
             ));
@@ -383,7 +426,7 @@ impl Response {
     }
 
     pub(crate) fn is_fail(&self) -> bool {
-        self.response_type == RESPONSE_TYPE_FAIL
+        self.response_type == STATUS_FAIL
     }
 
     pub(crate) fn signed_value(&self) -> i32 {
@@ -399,15 +442,15 @@ mod tests {
     fn mock_pit_entry(
         binary_type: BinaryType,
         device_type: DeviceType,
-        identifier: u32,
+        partition_id: u32,
     ) -> PitEntry {
         PitEntry {
             binary_type,
             device_type,
-            identifier,
+            partition_id,
             attributes: Attribute::default(),
             update_attributes: Default::default(),
-            block_size_or_offset: 0,
+            start_block: 0,
             block_count: 0,
             file_offset: 0,
             file_size: 0,
@@ -418,41 +461,41 @@ mod tests {
     }
 
     #[test]
-    fn test_file_transfer_end_layout_selection() {
+    fn test_slice_commit_layout_selection() {
         let modem_entry = mock_pit_entry(BinaryType::CommunicationProcessor, DeviceType::UFS, 80);
         let ap_entry = mock_pit_entry(BinaryType::ApplicationProcessor, DeviceType::MMC, 20);
 
         // Modern protocol (>= 3): CP/Modem uses Unified layout
-        let modern_cp = FileTransferEnd::new(0x1E00000, &modem_entry, true, 3);
+        let modern_cp = SliceCommit::new(0x1E00000, &modem_entry, true, 3);
         assert!(matches!(
             modern_cp,
-            FileTransferEnd::Unified {
-                sequence_byte_count: 0x1E00000,
-                partition_identifier: 80,
-                is_last_sequence: 1,
+            SliceCommit::Unified {
+                slice_size: 0x1E00000,
+                partition_id: 80,
+                is_end_of_file: 1,
                 ..
             }
         ));
 
         // Legacy protocol (< 3): CP/Modem uses LegacyModem layout
-        let legacy_cp = FileTransferEnd::new(0x100000, &modem_entry, true, 2);
+        let legacy_cp = SliceCommit::new(0x100000, &modem_entry, true, 2);
         assert!(matches!(
             legacy_cp,
-            FileTransferEnd::LegacyModem {
-                sequence_byte_count: 0x100000,
-                partition_identifier: 80,
-                is_last_sequence: 1,
+            SliceCommit::LegacyModem {
+                slice_size: 0x100000,
+                partition_id: 80,
+                is_end_of_file: 1,
                 ..
             }
         ));
 
         // ApplicationProcessor always uses Unified layout even on legacy protocol
-        let legacy_ap = FileTransferEnd::new(0x100000, &ap_entry, false, 1);
+        let legacy_ap = SliceCommit::new(0x100000, &ap_entry, false, 1);
         assert!(matches!(
             legacy_ap,
-            FileTransferEnd::Unified {
-                partition_identifier: 20,
-                is_last_sequence: 0,
+            SliceCommit::Unified {
+                partition_id: 20,
+                is_end_of_file: 0,
                 ..
             }
         ));
@@ -469,18 +512,18 @@ mod tests {
 
         let fail_bytes = [0xff, 0xff, 0xff, 0xff, 0xfb, 0xff, 0xff, 0xff]; // opcode -1, value -5
         let fail_resp = Response::parse(&fail_bytes).unwrap();
-        assert_eq!(fail_resp.response_type, RESPONSE_TYPE_FAIL);
+        assert_eq!(fail_resp.response_type, STATUS_FAIL);
         assert!(fail_resp.is_fail());
         assert_eq!(fail_resp.signed_value(), -5);
     }
 
     #[test]
-    fn test_flash_part_file_transfer_128k_alignment() {
+    fn test_start_slice_transmission_128k_alignment() {
         // Test size round-up behavior to 128 KB (0x20000)
         let check_aligned = |raw_size: u32, expected_aligned: u32| {
-            let packet = RequestPacket::flash_part_file_transfer(raw_size);
-            assert_eq!(packet.expected_response_type(), RESPONSE_TYPE_FILE_TRANSFER);
-            let packed = packet.pack();
+            let cmd = Command::start_slice_transmission(raw_size);
+            assert_eq!(cmd.expected_response_type(), CMD_TRANSMIT);
+            let packed = cmd.pack();
             let announced_size = u32::from_le_bytes(packed[8..12].try_into().unwrap());
             assert_eq!(announced_size, expected_aligned);
         };

@@ -21,8 +21,8 @@ mod error;
 mod firmware;
 mod flash;
 mod odin;
-mod packets;
 mod progress;
+mod protocol;
 mod usb;
 
 pub use device_info::{DeviceInfo, SessionDeviceInfo};

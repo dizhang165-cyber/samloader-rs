@@ -227,8 +227,8 @@ pub struct FirmwareFile<'a> {
 }
 
 impl<'a> FirmwareFile<'a> {
-    pub(crate) fn sequences(&self, sequence_max_bytes: usize) -> std::slice::Chunks<'_, u8> {
-        self.file.chunks(sequence_max_bytes)
+    pub(crate) fn slices(&self, slice_max_bytes: usize) -> std::slice::Chunks<'_, u8> {
+        self.file.chunks(slice_max_bytes)
     }
 }
 
@@ -243,23 +243,23 @@ pub struct FirmwareLz4File<'a> {
 }
 
 impl<'a> FirmwareLz4File<'a> {
-    pub(crate) fn sequences(&self, sequence_max_bytes: usize) -> Lz4SequenceIterator<'_> {
-        Lz4SequenceIterator {
+    pub(crate) fn slices(&self, slice_max_bytes: usize) -> Lz4SliceIterator<'_> {
+        Lz4SliceIterator {
             file: &self.file,
-            max_blocks: sequence_max_bytes / (1024 * 1024),
+            max_blocks: slice_max_bytes / (1024 * 1024),
             remaining_decompressed: self.header.content_size,
             bytes_read: LZ4_HEADER_SIZE,
             finished: false,
         }
     }
 
-    pub(crate) fn decompressed_sequences(
+    pub(crate) fn decompressed_slices(
         &self,
-        sequence_max_bytes: usize,
-    ) -> Lz4DecompressedSequenceIterator<'_> {
-        Lz4DecompressedSequenceIterator {
+        slice_max_bytes: usize,
+    ) -> Lz4DecompressedSliceIterator<'_> {
+        Lz4DecompressedSliceIterator {
             decoder: FrameDecoder::new(&self.file[..]),
-            sequence_max_bytes,
+            slice_max_bytes,
         }
     }
 }
@@ -272,7 +272,7 @@ pub enum FirmwareInfo<'a> {
     Lz4(FirmwareLz4File<'a>),
 }
 
-pub(crate) struct Lz4SequenceIterator<'a> {
+pub(crate) struct Lz4SliceIterator<'a> {
     file: &'a Mmap,
     max_blocks: usize,
     remaining_decompressed: u64,
@@ -280,7 +280,7 @@ pub(crate) struct Lz4SequenceIterator<'a> {
     finished: bool,
 }
 
-impl<'a> Iterator for Lz4SequenceIterator<'a> {
+impl<'a> Iterator for Lz4SliceIterator<'a> {
     type Item = (usize, &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -335,19 +335,19 @@ impl<'a> Iterator for Lz4SequenceIterator<'a> {
 }
 
 /// Iterator that produces decompressed byte chunks from an LZ4 stream.
-pub struct Lz4DecompressedSequenceIterator<'a> {
+pub struct Lz4DecompressedSliceIterator<'a> {
     decoder: FrameDecoder<&'a [u8]>,
-    sequence_max_bytes: usize,
+    slice_max_bytes: usize,
 }
 
-impl<'a> Iterator for Lz4DecompressedSequenceIterator<'a> {
+impl<'a> Iterator for Lz4DecompressedSliceIterator<'a> {
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut buffer = vec![0u8; self.sequence_max_bytes];
+        let mut buffer = vec![0u8; self.slice_max_bytes];
         let mut total_read = 0;
 
-        while total_read < self.sequence_max_bytes {
+        while total_read < self.slice_max_bytes {
             match self.decoder.read(&mut buffer[total_read..]) {
                 Ok(0) => break,
                 Ok(n) => total_read += n,

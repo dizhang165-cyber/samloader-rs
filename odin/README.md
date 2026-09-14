@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut session = connection.begin_session()?;
 
     // 4. Download and print the device's PIT layout (packet I/O)
-    let pit_bytes = session.download_pit_file()?;
+    let pit_bytes = session.receive_pit_info()?;
     println!("PIT downloaded successfully ({} bytes).", pit_bytes.len());
 
     // 5. Safely end the session

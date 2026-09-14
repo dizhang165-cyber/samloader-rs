@@ -15,8 +15,8 @@
 
 use crate::device_info::{DeviceInfo, SessionDeviceInfo};
 use crate::error::{LokeError, OdinError};
-use crate::packets::{self, RequestPacket};
 use crate::progress;
+use crate::protocol::{CMD_PIT, Command, DataChunk, Response, STREAMING_CHUNK_ACK};
 use crate::usb::UsbTransfer;
 use samloader_pit::PitEntry;
 use std::time::Duration;
@@ -24,16 +24,16 @@ use std::time::Duration;
 /// Manages the initial connection to a Samsung device in Download Mode.
 ///
 /// At this stage, communication is restricted to raw string commands (e.g. handshake
-/// strings or AT commands). Complex packet I/O requires transitioning to an [`OdinSession`]
+/// strings or AT commands). Complex command I/O requires transitioning to an [`OdinSession`]
 /// via [`begin_session`](Self::begin_session).
 pub struct OdinConnection {
     usb: Box<dyn UsbTransfer>,
     skip_empty_send: bool,
 }
 
-const FILE_TRANSFER_SEQUENCE_MAX_LENGTH_DEFAULT: usize = 800;
-const FILE_TRANSFER_PACKET_SIZE_DEFAULT: usize = 0x20000;
-const FILE_TRANSFER_SEQUENCE_TIMEOUT_DEFAULT: u32 = 30000;
+const MAX_SLICE_SIZE: usize = 30 * 1024 * 1024; // 30 MB (0x1E00000) staging limit in odin4
+const PACKET_SIZE_DEFAULT: usize = 0x20000; // 128 KB default before negotiation
+const SLICE_TIMEOUT_DEFAULT: u32 = 30000;
 
 impl OdinConnection {
     /// Creates a new `OdinConnection` instance with a given transport.
@@ -89,7 +89,7 @@ impl OdinConnection {
     pub fn send_string(&mut self, s: &str, timeout: i32) -> Result<(), OdinError> {
         progress::println_verbose(&format!("Sending string: {:?}", s));
         if !self.usb.send_data(s.as_bytes(), timeout, true) {
-            return Err(OdinError::SendPacketFailed);
+            return Err(OdinError::SendCommandFailed);
         }
         Ok(())
     }
@@ -118,7 +118,7 @@ impl OdinConnection {
     pub fn query_device_info(&mut self) -> Result<DeviceInfo, OdinError> {
         progress::println_verbose("Querying device info via DVIF...");
         if !self.usb.send_data(b"DVIF", 1000, false) {
-            return Err(OdinError::SendPacketFailed);
+            return Err(OdinError::SendCommandFailed);
         }
 
         let mut buffer = [0u8; 1024];
@@ -139,13 +139,12 @@ impl OdinConnection {
     }
 }
 
-/// An active flashing session coordinating Samsung Odin/Loke packet transfers.
+/// An active flashing session coordinating Samsung Odin/Loke command transfers.
 pub struct OdinSession {
     connection: OdinConnection,
 
-    file_transfer_sequence_max_length: usize,
-    file_transfer_packet_size: usize,
-    file_transfer_sequence_timeout: u32,
+    packet_size: usize,
+    slice_timeout: u32,
     lz4_supported: bool,
     bootloader_protocol_version: u32,
 }
@@ -156,15 +155,14 @@ impl OdinSession {
 
         let mut session = Self {
             connection,
-            file_transfer_sequence_max_length: FILE_TRANSFER_SEQUENCE_MAX_LENGTH_DEFAULT,
-            file_transfer_packet_size: FILE_TRANSFER_PACKET_SIZE_DEFAULT,
-            file_transfer_sequence_timeout: FILE_TRANSFER_SEQUENCE_TIMEOUT_DEFAULT,
+            packet_size: PACKET_SIZE_DEFAULT,
+            slice_timeout: SLICE_TIMEOUT_DEFAULT,
             lz4_supported: false,
             bootloader_protocol_version: 0,
         };
 
-        let packet = RequestPacket::begin_session();
-        let session_response = session.request_and_response(&packet, 3000)?;
+        let cmd = Command::begin_session();
+        let session_response = session.request_and_response(&cmd, 3000)?;
 
         session.bootloader_protocol_version = if session_response == 0 {
             1
@@ -179,12 +177,11 @@ impl OdinSession {
 
         if session.bootloader_protocol_version >= 2 {
             session.lz4_supported = (session_response & 0x8000) != 0;
-            session.file_transfer_sequence_timeout = 120000;
-            session.file_transfer_packet_size = 0x100000;
-            session.file_transfer_sequence_max_length = 30;
+            session.slice_timeout = 120000;
+            session.packet_size = 0x100000;
 
-            let packet = RequestPacket::file_part_size(session.file_transfer_packet_size as u32);
-            let value = session.request_and_response(&packet, 3000)?;
+            let cmd = Command::packet_size(session.packet_size as u32);
+            let value = session.request_and_response(&cmd, 3000)?;
 
             if value != 0 {
                 return Err(OdinError::Loke(LokeError::from_status(value as i32)));
@@ -199,8 +196,8 @@ impl OdinSession {
     pub fn end_session(&mut self) -> Result<(), OdinError> {
         progress::println("Ending session...");
 
-        let packet = RequestPacket::end_session();
-        let value = self.request_and_response(&packet, 3000)?;
+        let cmd = Command::close_connection();
+        let value = self.request_and_response(&cmd, 3000)?;
         if value != 0 {
             return Err(OdinError::Loke(LokeError::from_status(value as i32)));
         }
@@ -210,23 +207,23 @@ impl OdinSession {
 
     /// Reboots the device normally out of Download Mode.
     pub fn reboot_device(&mut self) -> Result<(), OdinError> {
-        self.reboot_with_packet(&RequestPacket::reboot_device(), "Rebooting device...")
+        self.reboot_with_command(&Command::reboot_device(), "Rebooting device...")
     }
 
     /// Reboots the device back into Download Mode.
     pub fn reboot_to_download(&mut self) -> Result<(), OdinError> {
-        self.reboot_with_packet(
-            &RequestPacket::reboot_to_download(),
+        self.reboot_with_command(
+            &Command::reboot_to_download(),
             "Rebooting device to Download Mode...",
         )
     }
 
-    fn reboot_with_packet(&mut self, packet: &RequestPacket, msg: &str) -> Result<(), OdinError> {
+    fn reboot_with_command(&mut self, cmd: &Command, msg: &str) -> Result<(), OdinError> {
         progress::println(msg);
 
-        // Send reboot packet using standard send_packet, which automatically
+        // Send reboot command using standard send_command, which automatically
         // appends an empty packet (ZLP) for "Gadget Serial" devices (e.g. S10).
-        let _ = self.send_packet(packet, 500);
+        let _ = self.send_command(cmd, 500);
 
         // Attempt to read from the IN endpoint to consume any response or ACK/ZLP
         // sent by the bootloader before resetting (required on devices such as A55).
@@ -248,10 +245,10 @@ impl OdinSession {
         self.connection
     }
 
-    fn send_packet(&mut self, packet: &RequestPacket, timeout: i32) -> Result<(), ()> {
-        progress::println_verbose(&format!("Sending packet: {:#04X?}", packet));
-        let packet_bytes = packet.pack();
-        if !self.connection.usb.send_data(&packet_bytes, timeout, true) {
+    fn send_command(&mut self, cmd: &Command, timeout: i32) -> Result<(), ()> {
+        progress::println_verbose(&format!("Sending command: {:#04X?}", cmd));
+        let cmd_bytes = cmd.pack();
+        if !self.connection.usb.send_data(&cmd_bytes, timeout, true) {
             return Err(());
         }
         if !self.connection.skip_empty_send {
@@ -260,21 +257,17 @@ impl OdinSession {
         Ok(())
     }
 
-    fn send_file_part(
-        &mut self,
-        packet: &packets::FilePartPacket<'_>,
-        timeout: i32,
-    ) -> Result<(), ()> {
-        progress::println_verbose(&format!("Sending packet: {:#04X?}", packet));
-        let packet_bytes = packet.as_bytes();
-        if !self.connection.usb.send_data(&packet_bytes, timeout, true) {
+    fn send_chunk(&mut self, chunk: &DataChunk<'_>, timeout: i32) -> Result<(), ()> {
+        progress::println_verbose(&format!("Sending chunk: {:#04X?}", chunk));
+        let chunk_bytes = chunk.as_bytes();
+        if !self.connection.usb.send_data(&chunk_bytes, timeout, true) {
             return Err(());
         }
         Ok(())
     }
 
-    fn receive_response(&mut self, timeout: i32) -> Result<packets::Response, OdinError> {
-        let mut buffer = [0u8; packets::Response::SIZE];
+    fn receive_response(&mut self, timeout: i32) -> Result<Response, OdinError> {
+        let mut buffer = [0u8; Response::SIZE];
         let mut received_size = self.connection.usb.receive_data(&mut buffer, timeout, true);
 
         // Mirror odin4: if 0 bytes received (a ZLP was received), read again
@@ -286,22 +279,18 @@ impl OdinSession {
             return Err(OdinError::ReceivePacketFailed);
         }
 
-        let parsed = packets::Response::parse(&buffer[..received_size as usize])
-            .map_err(OdinError::ParseError)?;
-        progress::println_verbose(&format!("Received packet: {:#04X?}", parsed));
+        let parsed =
+            Response::parse(&buffer[..received_size as usize]).map_err(OdinError::ParseError)?;
+        progress::println_verbose(&format!("Received response: {:#04X?}", parsed));
         Ok(parsed)
     }
 
-    fn request_and_response(
-        &mut self,
-        packet: &RequestPacket,
-        timeout: i32,
-    ) -> Result<u32, OdinError> {
-        self.send_packet(packet, timeout)
-            .map_err(|_| OdinError::SendPacketFailed)?;
+    fn request_and_response(&mut self, cmd: &Command, timeout: i32) -> Result<u32, OdinError> {
+        self.send_command(cmd, timeout)
+            .map_err(|_| OdinError::SendCommandFailed)?;
 
         let response = self.receive_response(timeout)?;
-        let expected_type = packet.expected_response_type();
+        let expected_type = cmd.expected_response_type();
 
         if response.is_fail() {
             return Err(OdinError::Loke(LokeError::from_status(
@@ -326,27 +315,27 @@ impl OdinSession {
     }
 
     /// Flashes/uploads raw PIT data to the device.
-    pub fn send_pit_data(&mut self, pit_buffer: &[u8]) -> Result<(), OdinError> {
+    pub fn send_pit_info(&mut self, pit_buffer: &[u8]) -> Result<(), OdinError> {
         let pit_buffer_size = pit_buffer.len() as u32;
 
         // Start file transfer
-        let packet = RequestPacket::pit_file_flash();
-        let value = self.request_and_response(&packet, 3000)?;
+        let cmd = Command::pit_flash();
+        let value = self.request_and_response(&cmd, 3000)?;
         if value != 0 {
             return Err(OdinError::Loke(LokeError::from_status(value as i32)));
         }
 
         // Transfer file size
-        let packet = RequestPacket::flash_part_pit_file(pit_buffer_size);
-        let value = self.request_and_response(&packet, 3000)?;
+        let cmd = Command::flash_pit_slice(pit_buffer_size);
+        let value = self.request_and_response(&cmd, 3000)?;
         if value != 0 {
             return Err(OdinError::Loke(LokeError::from_status(value as i32)));
         }
 
         // Flash pit file
-        let packet = packets::FilePartPacket::new(pit_buffer, pit_buffer_size as usize);
-        self.send_file_part(&packet, 3000)
-            .map_err(|_| OdinError::SendPacketFailed)?;
+        let chunk = DataChunk::new(pit_buffer, pit_buffer_size as usize);
+        self.send_chunk(&chunk, 3000)
+            .map_err(|_| OdinError::SendCommandFailed)?;
 
         let response = self.receive_response(3000)?;
 
@@ -356,11 +345,9 @@ impl OdinSession {
             )));
         }
 
-        if response.response_type != packets::RESPONSE_TYPE_SEND_FILE_PART
-            && response.response_type != packets::RESPONSE_TYPE_PIT_FILE
-        {
+        if response.response_type != STREAMING_CHUNK_ACK && response.response_type != CMD_PIT {
             return Err(OdinError::ResponseTypeMismatch {
-                expected: packets::RESPONSE_TYPE_PIT_FILE,
+                expected: CMD_PIT,
                 received: response.response_type,
             });
         }
@@ -372,8 +359,8 @@ impl OdinSession {
         }
 
         // End pit file transfer
-        let packet = RequestPacket::end_pit_file_transfer(pit_buffer_size);
-        let value = self.request_and_response(&packet, 3000)?;
+        let cmd = Command::end_pit_transfer(pit_buffer_size);
+        let value = self.request_and_response(&cmd, 3000)?;
         if value != 0 {
             return Err(OdinError::Loke(LokeError::from_status(value as i32)));
         }
@@ -382,9 +369,9 @@ impl OdinSession {
     }
 
     /// Downloads/dumps the active Partition Information Table (PIT) file from the device.
-    pub fn download_pit_file(&mut self) -> Result<Vec<u8>, OdinError> {
-        let packet = RequestPacket::pit_file_dump();
-        let file_size = self.request_and_response(&packet, 3000)? as usize;
+    pub fn receive_pit_info(&mut self) -> Result<Vec<u8>, OdinError> {
+        let cmd = Command::pit_dump();
+        let file_size = self.request_and_response(&cmd, 3000)? as usize;
 
         const PIT_CHUNK_SIZE: usize = 500;
         let transfer_count = file_size.div_ceil(PIT_CHUNK_SIZE);
@@ -392,9 +379,9 @@ impl OdinSession {
         let mut chunk = [0u8; PIT_CHUNK_SIZE];
 
         for i in 0..transfer_count {
-            let packet = RequestPacket::dump_part_pit_file(i as u32);
-            self.send_packet(&packet, 3000)
-                .map_err(|_| OdinError::SendPacketFailed)?;
+            let cmd = Command::dump_pit_slice(i as u32);
+            self.send_command(&cmd, 3000)
+                .map_err(|_| OdinError::SendCommandFailed)?;
 
             let expected_size = std::cmp::min(file_size - buffer.len(), PIT_CHUNK_SIZE);
 
@@ -414,8 +401,8 @@ impl OdinSession {
         self.connection.usb.receive_data(&mut empty, 100, false);
 
         // End file transfer
-        let packet = RequestPacket::pit_file_end();
-        let value = self.request_and_response(&packet, 3000)?;
+        let cmd = Command::pit_end();
+        let value = self.request_and_response(&cmd, 3000)?;
         if value != 0 {
             return Err(OdinError::Loke(LokeError::from_status(value as i32)));
         }
@@ -427,8 +414,8 @@ impl OdinSession {
     ///
     /// Available on bootloader protocol version >= 4. Kept as reference for mid-session inspection.
     pub fn dump_device_info(&mut self) -> Result<SessionDeviceInfo, OdinError> {
-        let packet = RequestPacket::device_info_dump();
-        let total_bytes = self.request_and_response(&packet, 3000)? as usize;
+        let cmd = Command::device_info_dump();
+        let total_bytes = self.request_and_response(&cmd, 3000)? as usize;
         if total_bytes == 0 || total_bytes > 0x100000 {
             return Err(OdinError::DeviceInfoUnavailable);
         }
@@ -439,9 +426,9 @@ impl OdinSession {
         let mut chunk = [0u8; CHUNK_SIZE];
 
         for i in 0..transfer_count {
-            let packet = RequestPacket::dump_part_device_info(i as u32);
-            self.send_packet(&packet, 3000)
-                .map_err(|_| OdinError::SendPacketFailed)?;
+            let cmd = Command::dump_device_info_slice(i as u32);
+            self.send_command(&cmd, 3000)
+                .map_err(|_| OdinError::SendCommandFailed)?;
 
             let expected_size = std::cmp::min(total_bytes - buffer.len(), CHUNK_SIZE);
             let received =
@@ -454,8 +441,8 @@ impl OdinSession {
             buffer.extend_from_slice(&chunk[..received as usize]);
         }
 
-        let packet = RequestPacket::end_device_info();
-        let value = self.request_and_response(&packet, 3000)?;
+        let cmd = Command::end_device_info();
+        let value = self.request_and_response(&cmd, 3000)?;
         if value != 0 {
             return Err(OdinError::Loke(LokeError::from_status(value as i32)));
         }
@@ -470,8 +457,8 @@ impl OdinSession {
             return Err(OdinError::InvalidSalesCode(sales_code.to_string()));
         }
         let code = [bytes[0], bytes[1], bytes[2]];
-        let packet = RequestPacket::session_sales_code(code);
-        let value = self.request_and_response(&packet, 3000)?;
+        let cmd = Command::session_sales_code(code);
+        let value = self.request_and_response(&cmd, 3000)?;
         if value != 0 {
             return Err(OdinError::Loke(LokeError::from_status(value as i32)));
         }
@@ -480,14 +467,13 @@ impl OdinSession {
 
     /// Dispatches a low-level hardware NAND Erase for the USERDATA partition (Opcode 0x64, Subcmd 7).
     ///
-    /// Instructs the device bootloader to issue a hardware flash block erase across the
-    /// `USERDATA` partition range (from the starting sector of `USERDATA` to the end of user storage).
-    ///
-    /// Returns the number of storage sectors erased by the device.
+    /// Instructs the device bootloader to issue an active hardware flash block erase across the
+    /// `USERDATA` partition range via the UEFI `EraseBlock` protocol, erasing dynamic partition
+    /// metadata and user data, and returns the device erase sector size.
     pub fn nand_erase(&mut self) -> Result<u32, OdinError> {
         progress::println("Erasing storage (USERDATA)...");
-        let packet = RequestPacket::nand_erase();
-        let erased_sectors = self.request_and_response(&packet, 60_000)?;
+        let cmd = Command::nand_erase();
+        let erased_sectors = self.request_and_response(&cmd, 60_000)?;
         progress::println(&format!(
             "Storage erased successfully ({} sectors)\n",
             erased_sectors
@@ -505,35 +491,31 @@ impl OdinSession {
         self.bootloader_protocol_version
     }
 
-    fn file_transfer_sequence_max_bytes(&self) -> usize {
-        self.file_transfer_packet_size * self.file_transfer_sequence_max_length
-    }
-
-    fn send_raw_sequences<Iter, Bytes>(
+    fn transmit_slices<Iter, Bytes>(
         &mut self,
-        sequences: Iter,
+        slices: Iter,
         pit_entry: &PitEntry,
     ) -> Result<(), OdinError>
     where
         Bytes: AsRef<[u8]>,
         Iter: Iterator<Item = Bytes>,
     {
-        let mut sequences = sequences.peekable();
-        while let Some(sequence_data) = sequences.next() {
-            let sequence_data = sequence_data.as_ref();
-            let init_packet = RequestPacket::file_transfer_flash(false);
-            let start_packet = RequestPacket::flash_part_file_transfer(sequence_data.len() as u32);
+        let mut slices = slices.peekable();
+        while let Some(slice_data) = slices.next() {
+            let slice_data = slice_data.as_ref();
+            let init_cmd = Command::transmit_flash(false);
+            let start_cmd = Command::start_slice_transmission(slice_data.len() as u32);
 
-            let is_last_sequence = sequences.peek().is_none();
-            let end_packet = RequestPacket::end_file_transfer(
-                sequence_data.len() as u32,
+            let is_last_slice = slices.peek().is_none();
+            let end_cmd = Command::commit_slice(
+                slice_data.len() as u32,
                 pit_entry,
-                is_last_sequence,
+                is_last_slice,
                 false,
                 self.bootloader_protocol_version,
             );
 
-            self.send_one_sequence(&init_packet, &start_packet, &end_packet, sequence_data)?;
+            self.transmit_slice(&init_cmd, &start_cmd, &end_cmd, slice_data)?;
         }
 
         Ok(())
@@ -542,8 +524,8 @@ impl OdinSession {
     /// Flashes an uncompressed partition firmware file payload to the device.
     pub fn send_file(&mut self, info: &crate::firmware::FirmwareFile) -> Result<(), OdinError> {
         progress::set_length(info.file.len() as u64);
-        let sequences = info.sequences(self.file_transfer_sequence_max_bytes());
-        self.send_raw_sequences(sequences, info.pit_entry)
+        let slices = info.slices(MAX_SLICE_SIZE);
+        self.transmit_slices(slices, info.pit_entry)
     }
 
     /// Flashes an LZ4-compressed partition firmware file payload to the device,
@@ -554,91 +536,85 @@ impl OdinSession {
     ) -> Result<(), OdinError> {
         if !self.lz4_supported || info.header.block_max_size != 1024 * 1024 {
             progress::set_length(info.header.content_size);
-            let sequences = info.decompressed_sequences(self.file_transfer_sequence_max_bytes());
-            return self.send_raw_sequences(sequences, info.pit_entry);
+            let slices = info.decompressed_slices(MAX_SLICE_SIZE);
+            return self.transmit_slices(slices, info.pit_entry);
         }
 
         progress::set_length(info.file.len() as u64);
 
-        let sequences = info.sequences(self.file_transfer_sequence_max_bytes());
+        let slices = info.slices(MAX_SLICE_SIZE);
 
-        let mut sequences = sequences.peekable();
-        while let Some((decompressed_size, sequence_data)) = sequences.next() {
-            let init_packet = RequestPacket::file_transfer_flash(true);
-            let start_packet = RequestPacket::flash_part_lz4_file_transfer(
-                sequence_data.len() as u32,
+        let mut slices = slices.peekable();
+        while let Some((decompressed_size, slice_data)) = slices.next() {
+            let init_cmd = Command::transmit_flash(true);
+            let start_cmd = Command::start_lz4_slice_transmission(
+                slice_data.len() as u32,
                 decompressed_size as u32,
             );
 
-            let is_last_sequence = sequences.peek().is_none();
-            let end_packet = RequestPacket::end_file_transfer(
+            let is_last_slice = slices.peek().is_none();
+            let end_cmd = Command::commit_slice(
                 decompressed_size as u32,
                 info.pit_entry,
-                is_last_sequence,
+                is_last_slice,
                 true,
                 self.bootloader_protocol_version,
             );
 
-            self.send_one_sequence(&init_packet, &start_packet, &end_packet, sequence_data)?;
+            self.transmit_slice(&init_cmd, &start_cmd, &end_cmd, slice_data)?;
         }
 
         Ok(())
     }
 
-    fn send_one_sequence(
+    fn transmit_slice(
         &mut self,
-        init_packet: &RequestPacket,
-        start_packet: &RequestPacket,
-        end_packet: &RequestPacket,
-        sequence_data: &[u8],
+        init_cmd: &Command,
+        start_cmd: &Command,
+        end_cmd: &Command,
+        slice_data: &[u8],
     ) -> Result<(), OdinError> {
-        let init_val = self.request_and_response(init_packet, 3000)?;
+        let init_val = self.request_and_response(init_cmd, 3000)?;
         if init_val != 0 {
             return Err(OdinError::Loke(LokeError::from_status(init_val as i32)));
         }
 
-        let start_val = self.request_and_response(start_packet, 3000)?;
+        let start_val = self.request_and_response(start_cmd, 3000)?;
         if start_val != 0 {
             return Err(OdinError::Loke(LokeError::from_status(start_val as i32)));
         }
 
-        for (file_part_index, file_buffer) in sequence_data
-            .chunks(self.file_transfer_packet_size)
-            .enumerate()
-        {
+        for (chunk_index, chunk_buffer) in slice_data.chunks(self.packet_size).enumerate() {
             let mut success = false;
             for retry in 0..5 {
                 if retry > 0 {
                     progress::println("\nRetrying...");
                 }
 
-                let packet =
-                    packets::FilePartPacket::new(file_buffer, self.file_transfer_packet_size);
+                let chunk = DataChunk::new(chunk_buffer, self.packet_size);
 
-                if self.send_file_part(&packet, 3000).is_err() {
+                if self.send_chunk(&chunk, 3000).is_err() {
                     continue;
                 }
 
-                if let Ok(response) =
-                    self.receive_response(self.file_transfer_sequence_timeout as i32)
-                {
+                if let Ok(response) = self.receive_response(self.slice_timeout as i32) {
                     if response.is_fail() {
                         return Err(OdinError::Loke(LokeError::from_status(
                             response.signed_value(),
                         )));
                     }
-                    if response.response_type == packets::RESPONSE_TYPE_SEND_FILE_PART {
+                    if response.response_type == STREAMING_CHUNK_ACK {
                         if response.signed_value() < 0 {
                             return Err(OdinError::Loke(LokeError::from_status(
                                 response.signed_value(),
                             )));
                         }
-                        if response.value as usize == file_part_index {
+                        if response.value as usize == chunk_index {
                             success = true;
                             break;
                         } else if retry == 0 {
-                            return Err(OdinError::FilePartIndexMismatch {
-                                expected: file_part_index,
+                            return Err(OdinError::ChunkIndexMismatch {
+                                expected: chunk_index,
                                 received: response.value,
                             });
                         }
@@ -647,14 +623,13 @@ impl OdinSession {
             }
 
             if !success {
-                return Err(OdinError::FilePartResponseReceiveFailed);
+                return Err(OdinError::ChunkResponseReceiveFailed);
             }
 
-            progress::inc(file_buffer.len() as u64);
+            progress::inc(chunk_buffer.len() as u64);
         }
 
-        let end_val =
-            self.request_and_response(end_packet, self.file_transfer_sequence_timeout as i32)?;
+        let end_val = self.request_and_response(end_cmd, self.slice_timeout as i32)?;
         if end_val != 0 {
             return Err(OdinError::Loke(LokeError::from_status(end_val as i32)));
         }
@@ -665,8 +640,8 @@ impl OdinSession {
     /// Sets the total expected session bytes to be flashed, allowing the device
     /// to update its progress indicator.
     pub fn set_total_bytes(&mut self, total_bytes: u64) -> Result<(), OdinError> {
-        let packet = RequestPacket::total_bytes(total_bytes);
-        let value = self.request_and_response(&packet, 3000)?;
+        let cmd = Command::total_bytes(total_bytes);
+        let value = self.request_and_response(&cmd, 3000)?;
 
         if value != 0 {
             return Err(OdinError::Loke(LokeError::from_status(value as i32)));
@@ -677,8 +652,8 @@ impl OdinSession {
 
     /// Performs a pre-flight dynamic partition size check on modern LOKE bootloaders.
     pub fn check_super_size(&mut self, super_used_size: u32) -> Result<(), OdinError> {
-        let packet = RequestPacket::check_super_size(super_used_size);
-        let value = self.request_and_response(&packet, 3000)?;
+        let cmd = Command::check_super_size(super_used_size);
+        let value = self.request_and_response(&cmd, 3000)?;
 
         if value != 0 {
             return Err(OdinError::Loke(LokeError::from_status(value as i32)));
@@ -741,10 +716,11 @@ pub fn query_device_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::CMD_SESSION_INIT;
     use crate::usb::MockBackend;
 
     #[test]
-    fn test_odin_mock_multi_sequence_transfer() {
+    fn test_odin_mock_multi_slice_transfer() {
         let backend = Box::new(MockBackend::new(false));
         let mut connection = OdinConnection::new(backend);
         assert!(connection.init().is_ok());
@@ -753,10 +729,10 @@ mod tests {
         let pit_entry = PitEntry {
             binary_type: samloader_pit::BinaryType::ApplicationProcessor,
             device_type: samloader_pit::DeviceType::MMC,
-            identifier: 20,
+            partition_id: 20,
             attributes: Default::default(),
             update_attributes: Default::default(),
-            block_size_or_offset: 0,
+            start_block: 0,
             block_count: 0,
             file_offset: 0,
             file_size: 0,
@@ -765,12 +741,12 @@ mod tests {
             fota_filename: Default::default(),
         };
 
-        // 2 sequences of 128 KB each (matching MockBackend packet_size)
+        // 2 slices of 128 KB each (matching MockBackend packet_size)
         let seq1 = vec![0xAAu8; 0x20000];
         let seq2 = vec![0xBBu8; 0x20000];
-        let sequences = vec![seq1, seq2].into_iter();
+        let slices = vec![seq1, seq2].into_iter();
 
-        assert!(session.send_raw_sequences(sequences, &pit_entry).is_ok());
+        assert!(session.transmit_slices(slices, &pit_entry).is_ok());
 
         assert!(session.close().is_ok());
     }
@@ -873,16 +849,15 @@ mod tests {
 
         let mut session = OdinSession {
             connection: conn,
-            file_transfer_sequence_max_length: 30,
-            file_transfer_packet_size: 0x20000,
-            file_transfer_sequence_timeout: 3000,
+            packet_size: 0x20000,
+            slice_timeout: 3000,
             lz4_supported: false,
             bootloader_protocol_version: 2,
         };
 
         // 1. Control request packet -> must send 1024 bytes followed by 0 bytes (ZLP)
-        let req = RequestPacket::begin_session();
-        assert!(session.send_packet(&req, 1000).is_ok());
+        let req = Command::begin_session();
+        assert!(session.send_command(&req, 1000).is_ok());
 
         {
             let inner = spy_inner.lock().unwrap();
@@ -893,8 +868,8 @@ mod tests {
 
         // 2. Data chunk -> must send raw chunk bytes with NO ZLP
         let chunk_data = vec![0xABu8; 1024];
-        let file_part = packets::FilePartPacket::new(&chunk_data, chunk_data.len());
-        assert!(session.send_file_part(&file_part, 1000).is_ok());
+        let chunk = DataChunk::new(&chunk_data, chunk_data.len());
+        assert!(session.send_chunk(&chunk, 1000).is_ok());
 
         {
             let inner = spy_inner.lock().unwrap();
@@ -925,16 +900,15 @@ mod tests {
 
         let mut session = OdinSession {
             connection: conn,
-            file_transfer_sequence_max_length: 30,
-            file_transfer_packet_size: 0x20000,
-            file_transfer_sequence_timeout: 3000,
+            packet_size: 0x20000,
+            slice_timeout: 3000,
             lz4_supported: false,
             bootloader_protocol_version: 2,
         };
 
         // 1. Control request packet -> only sends 1024 bytes, no ZLP
-        let req = RequestPacket::begin_session();
-        assert!(session.send_packet(&req, 1000).is_ok());
+        let req = Command::begin_session();
+        assert!(session.send_command(&req, 1000).is_ok());
 
         {
             let inner = spy_inner.lock().unwrap();
@@ -957,7 +931,7 @@ mod tests {
 
         // Push a 0-length packet first (ZLP), followed by a valid 8-byte response packet
         let mut response_bytes = Vec::new();
-        response_bytes.extend_from_slice(&packets::RESPONSE_TYPE_SESSION_SETUP.to_le_bytes());
+        response_bytes.extend_from_slice(&CMD_SESSION_INIT.to_le_bytes());
         response_bytes.extend_from_slice(&0u32.to_le_bytes());
 
         {
@@ -974,9 +948,8 @@ mod tests {
         let conn = OdinConnection::new(spy);
         let mut session = OdinSession {
             connection: conn,
-            file_transfer_sequence_max_length: 30,
-            file_transfer_packet_size: 0x20000,
-            file_transfer_sequence_timeout: 3000,
+            packet_size: 0x20000,
+            slice_timeout: 3000,
             lz4_supported: false,
             bootloader_protocol_version: 2,
         };
@@ -984,7 +957,7 @@ mod tests {
         let response = session
             .receive_response(1000)
             .expect("Should retry after 0-byte packet and receive response");
-        assert_eq!(response.response_type, packets::RESPONSE_TYPE_SESSION_SETUP);
+        assert_eq!(response.response_type, CMD_SESSION_INIT);
         assert_eq!(response.value, 0);
     }
 }

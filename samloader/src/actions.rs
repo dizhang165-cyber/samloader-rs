@@ -99,7 +99,7 @@ pub(crate) fn action_dump_pit(
     let mut success = true;
 
     println!("Downloading device's PIT file");
-    match session.download_pit_file() {
+    match session.receive_pit_info() {
         Ok(pit_buffer) => {
             if let Err(e) = output_file.write_all(&pit_buffer) {
                 print_error!("Failed to write PIT data to output file: {}", e);
@@ -197,7 +197,7 @@ pub(crate) fn action_print_pit(
         let mut device_pit_data = None;
 
         println!("Downloading device's PIT file");
-        match session.download_pit_file() {
+        match session.receive_pit_info() {
             Ok(device_pit) => match PitData::new(&device_pit) {
                 Ok(pit_data) => {
                     device_pit_data = Some(pit_data);

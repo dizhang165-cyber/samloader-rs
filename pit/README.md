@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Look up a specific partition entry by name
     if let Some(entry) = pit_data.find_entry_by_name("RECOVERY") {
-        println!("Recovery partition offset: {}", entry.block_size_or_offset);
+        println!("Recovery partition offset: {}", entry.start_block);
         println!("Recovery partition size in bytes: {}", entry.partition_size());
     }
 

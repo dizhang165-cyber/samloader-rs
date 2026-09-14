@@ -460,12 +460,12 @@ impl<'a> FlashManager<'a> {
         if repartition {
             progress::println("Flashing PIT");
             self.session
-                .send_pit_data(self.pit_file_bytes.as_ref().unwrap())?;
+                .send_pit_info(self.pit_file_bytes.as_ref().unwrap())?;
             progress::println("PIT flash successful\n");
         }
 
         progress::println("Downloading device's PIT file");
-        let pit_buffer = self.session.download_pit_file()?;
+        let pit_buffer = self.session.receive_pit_info()?;
 
         let pit_data = PitData::new(&pit_buffer).map_err(FlashError::PitUnpackFailed)?;
         Ok(pit_data)
@@ -546,7 +546,7 @@ impl<'a> FlashManager<'a> {
         let mut mapped_partition_ids = HashSet::new();
         let mut unique_planned = Vec::new();
         for planned in planned_partitions.into_iter().rev() {
-            if mapped_partition_ids.insert(planned.pit_entry.identifier) {
+            if mapped_partition_ids.insert(planned.pit_entry.partition_id) {
                 unique_planned.push(planned);
             }
         }
