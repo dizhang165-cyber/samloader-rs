@@ -26,7 +26,7 @@ use samloader_pit::PitData;
 use std::collections::VecDeque;
 use std::io::Cursor;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
     Uninitialized,
     HandshakeComplete,
@@ -37,7 +37,7 @@ enum State {
 }
 
 /// Target hardware, partition table, and protocol characteristics of a simulated Samsung device.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct DeviceProfile {
     /// Device model string (e.g. `"SM-F968B"` or `"GT-I9305"`).
     pub model: String,
@@ -230,7 +230,7 @@ impl DeviceProfile {
 }
 
 /// Fluent builder for constructing custom `DeviceProfile` instances.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DeviceProfileBuilder {
     profile: DeviceProfile,
 }

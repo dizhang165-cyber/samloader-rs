@@ -13,7 +13,7 @@
 // limitations under the License.
 
 /// Events emitted during firmware flashing and verification.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum FlashEvent<'a> {
     /// Partition flashing has started.
     PartitionStart {

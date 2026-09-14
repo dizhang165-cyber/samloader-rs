@@ -199,7 +199,7 @@ fn get_xml_node_data(node: Node) -> HashMap<String, String> {
 }
 
 /// Detailed information about a firmware binary package.
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct BinaryInform {
     /// The firmware build version identifier (e.g., PDA/CSC/PHONE/PHONE).
     pub version: String,

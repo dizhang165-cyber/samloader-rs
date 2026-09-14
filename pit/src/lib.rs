@@ -33,7 +33,7 @@ const FLASH_FILENAME_LENGTH: usize = 32;
 const FOTA_FILENAME_LENGTH: usize = 32;
 
 /// A fixed-length null-padded ASCII/UTF-8 string used in PIT binary headers.
-#[derive(BinRead, BinWrite, PartialEq, Eq)]
+#[derive(BinRead, BinWrite)]
 pub struct FixedString<const LEN: usize> {
     data: [u8; LEN],
 }
@@ -77,7 +77,7 @@ pub enum BinaryType {
 }
 
 /// Represents the physical flash/storage media type on the device.
-#[derive(BinRead, BinWrite, PartialEq, Eq, Copy, Clone, Debug)]
+#[derive(BinRead, BinWrite, Copy, Clone, Debug)]
 #[brw(repr = u32)]
 pub enum DeviceType {
     /// OneNAND flash storage.
@@ -94,7 +94,7 @@ pub enum DeviceType {
 
 /// Partition block properties and flags.
 #[bitfield(bits = 32)]
-#[derive(BinRead, BinWrite, Copy, Clone, Default, PartialEq, Eq)]
+#[derive(BinRead, BinWrite, Copy, Clone, Default)]
 #[br(map = |x: u32| Self::from_bytes(x.to_le_bytes()))]
 #[bw(map = |x: &Self| u32::from_le_bytes(x.into_bytes()))]
 pub struct Attribute {
@@ -108,7 +108,7 @@ pub struct Attribute {
 
 /// Partition update and firmware attribute flags.
 #[bitfield(bits = 32)]
-#[derive(BinRead, BinWrite, Copy, Clone, Default, PartialEq, Eq)]
+#[derive(BinRead, BinWrite, Copy, Clone, Default)]
 #[br(map = |x: u32| Self::from_bytes(x.to_le_bytes()))]
 #[bw(map = |x: &Self| u32::from_le_bytes(x.into_bytes()))]
 pub struct UpdateAttribute {
@@ -122,7 +122,6 @@ pub struct UpdateAttribute {
 
 /// Represents an individual partition entry in the Partition Information Table (PIT).
 #[binrw]
-#[derive(PartialEq, Eq)]
 #[brw(little)]
 pub struct PitEntry {
     /// Target processor for the partition.
@@ -167,7 +166,6 @@ impl PitEntry {
 
 /// Represents the parsed layout and headers of a Partition Information Table (PIT).
 #[binrw]
-#[derive(PartialEq, Eq)]
 #[brw(little)]
 pub struct PitData {
     /// Magic identifier for verification (always 0x12349876).

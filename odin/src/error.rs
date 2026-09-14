@@ -130,7 +130,7 @@ pub enum OdinError {
 }
 
 /// Detailed error status reported by the Samsung LOKE bootloader.
-#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Error, Debug, PartialEq, Eq)]
 pub enum LokeError {
     /// General failure / operation aborted / buffer overflow (-1 or 0).
     #[error("LOKE returned general failure (FAIL!) [code: {0}]")]

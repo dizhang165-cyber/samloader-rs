@@ -142,7 +142,7 @@ pub(crate) enum TransmitCommand {
 }
 
 /// Descriptor sent to commit and flash a completed slice to physical storage.
-#[derive(BinRead, BinWrite, Debug, PartialEq, Eq)]
+#[derive(BinRead, BinWrite, Debug)]
 #[brw(little)]
 pub(crate) enum SliceCommit {
     /// Modern unified layout used by odin4 (bootloader_protocol_version >= 3).
@@ -198,7 +198,7 @@ impl SliceCommit {
 }
 
 /// Subcommands for [`CMD_CLOSE_CONNECTION`] (0x67).
-#[derive(BinRead, BinWrite, Debug, PartialEq, Eq)]
+#[derive(BinRead, BinWrite, Debug)]
 #[brw(little)]
 pub(crate) enum CloseConnectionCommand {
     #[brw(magic = 0u32)]
@@ -210,7 +210,7 @@ pub(crate) enum CloseConnectionCommand {
 }
 
 /// Subcommands for [`CMD_DEVINFO`] (0x69).
-#[derive(BinRead, BinWrite, Debug, PartialEq, Eq)]
+#[derive(BinRead, BinWrite, Debug)]
 #[brw(little)]
 pub(crate) enum DeviceInfoCommand {
     #[brw(magic = 0u32)]
@@ -222,7 +222,7 @@ pub(crate) enum DeviceInfoCommand {
 }
 
 /// Subcommands for [`CMD_DDP`] (0x6a).
-#[derive(BinRead, BinWrite, Debug, PartialEq, Eq)]
+#[derive(BinRead, BinWrite, Debug)]
 #[brw(little)]
 pub(crate) enum DynamicPartitionCommand {
     #[brw(magic = 0u32)]
@@ -400,7 +400,7 @@ impl<'a> DataChunk<'a> {
 }
 
 /// 8-byte response returned by Samsung LOKE bootloader for commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct Response {
     pub response_type: u32,
     pub value: u32,
@@ -437,7 +437,6 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use samloader_pit::Attribute;
 
     fn mock_pit_entry(
         binary_type: BinaryType,
@@ -448,7 +447,7 @@ mod tests {
             binary_type,
             device_type,
             partition_id,
-            attributes: Attribute::default(),
+            attributes: Default::default(),
             update_attributes: Default::default(),
             start_block: 0,
             block_count: 0,

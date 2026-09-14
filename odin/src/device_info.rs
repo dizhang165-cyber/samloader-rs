@@ -18,7 +18,7 @@ use std::fmt;
 
 /// Diagnostic and identity information retrieved from a connected Samsung device in Download mode.
 /// This corresponds to the pre-handshake `DVIF` ASCII query.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Default)]
 pub struct DeviceInfo {
     /// The Samsung device model string (e.g., `"SM-F968B"` or `"SM-S931U1"`).
     pub model: Option<String>,
@@ -153,7 +153,7 @@ impl fmt::Display for DeviceInfo {
 }
 
 /// Device information returned by the in-session binary protocol (Opcode `0x69`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Default)]
 pub struct SessionDeviceInfo {
     /// Tag 0: Device model string (e.g. `"SM-F968B"`).
     pub model: Option<String>,
