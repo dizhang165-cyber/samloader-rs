@@ -58,7 +58,10 @@ impl DownloadProgress for ProgressWrapper<'_> {
     }
 
     fn set_position(&self, pos: u64) {
+        self.progress_bar.disable_steady_tick();
         self.progress_bar.set_position(pos);
+        self.progress_bar.reset_elapsed();
+        self.progress_bar.enable_steady_tick(Duration::from_secs(1));
     }
 
     fn inc(&self, bytes: u64) {
