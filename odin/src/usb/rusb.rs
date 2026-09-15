@@ -206,8 +206,22 @@ impl UsbBackend for RusbBackend {
 
 impl UsbTransfer for RusbBackend {
     fn reset(&mut self) {
-        if let Err(e) = self.handle.reset() {
-            print_warning!(self.verbose, "Failed to reset device! Result: {}", e);
+        if let Err(e) = self.handle.clear_halt(self.in_endpoint) {
+            print_warning!(self.verbose, "Failed to clear IN endpoint halt: {}", e);
+        }
+        if let Err(e) = self.handle.clear_halt(self.out_endpoint) {
+            print_warning!(self.verbose, "Failed to clear OUT endpoint halt: {}", e);
+        }
+
+        let mut buf = [0u8; 1024];
+        loop {
+            match self
+                .handle
+                .read_bulk(self.in_endpoint, &mut buf, Duration::from_millis(10))
+            {
+                Ok(n) if n > 0 => continue,
+                _ => break,
+            }
         }
     }
 

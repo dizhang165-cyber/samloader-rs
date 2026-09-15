@@ -18,7 +18,6 @@ use super::*;
 /// USB communication backend using `nusb`.
 pub struct NusbBackend {
     verbose: bool,
-    handle: ::nusb::Device,
     ep_in: ::nusb::Endpoint<::nusb::transfer::Bulk, ::nusb::transfer::In>,
     ep_out: ::nusb::Endpoint<::nusb::transfer::Bulk, ::nusb::transfer::Out>,
     product: Option<String>,
@@ -119,7 +118,6 @@ impl UsbBackend for NusbBackend {
 
         Ok(Self {
             verbose,
-            handle,
             ep_in,
             ep_out,
             product,
@@ -153,8 +151,26 @@ impl UsbBackend for NusbBackend {
 
 impl UsbTransfer for NusbBackend {
     fn reset(&mut self) {
-        if let Err(e) = self.handle.reset().wait() {
-            print_warning!(self.verbose, "Failed to reset device! Result: {}", e);
+        if let Err(e) = self.ep_in.clear_halt().wait() {
+            print_warning!(self.verbose, "Failed to clear IN endpoint halt: {}", e);
+        }
+        if let Err(e) = self.ep_out.clear_halt().wait() {
+            print_warning!(self.verbose, "Failed to clear OUT endpoint halt: {}", e);
+        }
+
+        let max_packet_size = self.ep_in.max_packet_size();
+        let buf_size = if max_packet_size > 0 {
+            max_packet_size
+        } else {
+            1024
+        };
+        loop {
+            let buf = ::nusb::transfer::Buffer::new(buf_size);
+            let completion = self.ep_in.transfer_blocking(buf, Duration::from_millis(10));
+            match completion.status {
+                Ok(()) if completion.actual_len > 0 => continue,
+                _ => break,
+            }
         }
     }
 

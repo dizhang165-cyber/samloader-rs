@@ -70,9 +70,16 @@ impl OdinConnection {
         self.send_string("ODIN", 1000)
             .map_err(|_| OdinError::HandshakeSendFailed)?;
 
-        let response = self
+        let mut response = self
             .receive_string(1000)
             .map_err(|_| OdinError::HandshakeReceiveFailed)?;
+
+        if response != "LOKE"
+            && response.starts_with("FAIL")
+            && self.receive_string(500).is_ok_and(|s| s == "LOKE")
+        {
+            response = "LOKE".to_string();
+        }
 
         if response == "LOKE" {
             progress::println("Protocol initialization successful.\n");
@@ -962,5 +969,29 @@ mod tests {
             .expect("Should retry after 0-byte packet and receive response");
         assert_eq!(response.response_type, CMD_SESSION_INIT);
         assert_eq!(response.value, 0);
+    }
+
+    #[test]
+    fn test_handshake_recovers_from_queued_fail_response() {
+        let spy_inner = std::sync::Arc::new(std::sync::Mutex::new(SpyTransferInner::default()));
+
+        {
+            let mut inner = spy_inner.lock().unwrap();
+            // Queue "FAILunknown command" followed by "LOKE"
+            inner.read_queue.push_back(b"FAILunknown command".to_vec());
+            inner.read_queue.push_back(b"LOKE".to_vec());
+        }
+
+        let spy = Box::new(SpyTransfer {
+            inner: spy_inner.clone(),
+            product: None,
+        });
+
+        let mut conn = OdinConnection::new(spy);
+        assert!(conn.init().is_ok());
+
+        let inner = spy_inner.lock().unwrap();
+        assert_eq!(inner.sent_data.len(), 1);
+        assert_eq!(inner.sent_data[0], b"ODIN");
     }
 }
