@@ -27,9 +27,7 @@ mod usb;
 
 pub use device_info::{DeviceInfo, SessionDeviceInfo};
 pub use error::{FlashError, LokeError, OdinError};
-pub use firmware::{
-    FirmwareFile, FirmwareInfo, FirmwareLz4File, Lz4FrameHeader, verify_md5_footer,
-};
+pub use firmware::verify_md5_footer;
 pub use flash::{FlashManager, RebootMode};
 pub use odin::{OdinConnection, OdinSession, query_device_info, reboot_download};
 pub use progress::{FlashEvent, FlashProgress, clear_progress, set_progress};
@@ -45,6 +43,10 @@ pub use usb::RusbBackend;
 pub use usb::SerialBackend;
 
 // Re-export public dependencies to avoid type mismatch and SemVer issues in public APIs.
+#[cfg(feature = "nusb")]
+pub use nusb;
 #[cfg(feature = "rusb")]
 pub use rusb;
 pub use samloader_pit;
+#[cfg(feature = "serialport")]
+pub use serialport;

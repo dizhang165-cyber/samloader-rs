@@ -121,16 +121,16 @@ pub fn verify_md5_footer<R: Read + Seek>(mut reader: R, name: &str) -> io::Resul
 }
 
 /// Header containing metadata parsed from an LZ4 frame.
-pub struct Lz4FrameHeader {
+pub(crate) struct Lz4FrameHeader {
     /// Total size of the decompressed content in bytes.
-    pub content_size: u64,
+    pub(crate) content_size: u64,
     /// Maximum size of a block in bytes.
-    pub block_max_size: u64,
+    pub(crate) block_max_size: u64,
 }
 
 impl Lz4FrameHeader {
     /// Parses the LZ4 frame header from a reader.
-    pub fn parse<R: Read>(mut reader: R) -> io::Result<Self> {
+    pub(crate) fn parse<R: Read>(mut reader: R) -> io::Result<Self> {
         let mut magic_bytes = [0u8; 4];
         reader.read_exact(&mut magic_bytes)?;
         let magic = u32::from_le_bytes(magic_bytes);
@@ -219,11 +219,11 @@ impl Lz4FrameHeader {
 }
 
 /// An uncompressed firmware file mapped in memory.
-pub struct FirmwareFile<'a> {
+pub(crate) struct FirmwareFile<'a> {
     /// PIT partition entry associated with this file.
-    pub pit_entry: &'a PitEntry,
+    pub(crate) pit_entry: &'a PitEntry,
     /// Memory-mapped file content payload.
-    pub file: Mmap,
+    pub(crate) file: Mmap,
 }
 
 impl<'a> FirmwareFile<'a> {
@@ -233,13 +233,13 @@ impl<'a> FirmwareFile<'a> {
 }
 
 /// An LZ4-compressed firmware file mapped in memory.
-pub struct FirmwareLz4File<'a> {
+pub(crate) struct FirmwareLz4File<'a> {
     /// PIT partition entry associated with this file.
-    pub pit_entry: &'a PitEntry,
+    pub(crate) pit_entry: &'a PitEntry,
     /// Memory-mapped file content payload.
-    pub file: Mmap,
+    pub(crate) file: Mmap,
     /// Metadata header of the LZ4 frame.
-    pub header: Lz4FrameHeader,
+    pub(crate) header: Lz4FrameHeader,
 }
 
 impl<'a> FirmwareLz4File<'a> {
@@ -265,7 +265,7 @@ impl<'a> FirmwareLz4File<'a> {
 }
 
 /// Enum wrapping a firmware file payload variant.
-pub enum FirmwareInfo<'a> {
+pub(crate) enum FirmwareInfo<'a> {
     /// Uncompressed normal firmware file payload.
     Normal(FirmwareFile<'a>),
     /// LZ4-compressed firmware file payload.
@@ -335,7 +335,7 @@ impl<'a> Iterator for Lz4SliceIterator<'a> {
 }
 
 /// Iterator that produces decompressed byte chunks from an LZ4 stream.
-pub struct Lz4DecompressedSliceIterator<'a> {
+pub(crate) struct Lz4DecompressedSliceIterator<'a> {
     decoder: FrameDecoder<&'a [u8]>,
     slice_max_bytes: usize,
 }

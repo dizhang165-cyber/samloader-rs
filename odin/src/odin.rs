@@ -522,7 +522,10 @@ impl OdinSession {
     }
 
     /// Flashes an uncompressed partition firmware file payload to the device.
-    pub fn send_file(&mut self, info: &crate::firmware::FirmwareFile) -> Result<(), OdinError> {
+    pub(crate) fn send_file(
+        &mut self,
+        info: &crate::firmware::FirmwareFile,
+    ) -> Result<(), OdinError> {
         progress::set_length(info.file.len() as u64);
         let slices = info.slices(MAX_SLICE_SIZE);
         self.transmit_slices(slices, info.pit_entry)
@@ -530,7 +533,7 @@ impl OdinSession {
 
     /// Flashes an LZ4-compressed partition firmware file payload to the device,
     /// decompressing on-the-fly if needed.
-    pub fn send_lz4_file(
+    pub(crate) fn send_lz4_file(
         &mut self,
         info: &crate::firmware::FirmwareLz4File,
     ) -> Result<(), OdinError> {
