@@ -360,32 +360,39 @@ impl<'a> FlashManager<'a> {
                 let (normalized_name, is_lz4) = normalize_basename(&entry_path);
 
                 if normalized_name == "download-list.txt" {
-                    self.has_download_list = true;
                     // Read the allowlist manifest
                     let mut reader = entry;
                     let mut content = String::new();
-                    if reader.read_to_string(&mut content).is_ok() {
-                        let download_list = content
-                            .lines()
-                            .filter_map(|s| {
-                                let s = s.trim();
-                                if s.is_empty() {
-                                    None
-                                } else {
-                                    Some(s.to_string())
-                                }
-                            })
-                            .collect();
-                        archives_download_lists.push(download_list);
-                    }
+                    reader
+                        .read_to_string(&mut content)
+                        .map_err(|e| FlashError::ArchiveCorrupted(pkg.clone(), e))?;
+
+                    self.has_download_list = true;
+                    let download_list = content
+                        .lines()
+                        .filter_map(|s| {
+                            let s = s.trim();
+                            if s.is_empty() {
+                                None
+                            } else {
+                                Some(s.to_string())
+                            }
+                        })
+                        .collect();
+                    archives_download_lists.push(download_list);
                 } else if normalized_name == "super_used_size.txt" {
                     let mut reader = entry;
                     let mut content = String::new();
-                    if reader.read_to_string(&mut content).is_ok()
-                        && let Ok(val) = content.trim().parse::<u32>()
-                    {
-                        self.super_used_size = Some(val);
-                    }
+                    reader
+                        .read_to_string(&mut content)
+                        .map_err(|e| FlashError::ArchiveCorrupted(pkg.clone(), e))?;
+                    let val = content.trim().parse::<u32>().map_err(|e| {
+                        FlashError::ArchiveCorrupted(
+                            pkg.clone(),
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+                        )
+                    })?;
+                    self.super_used_size = Some(val);
                 } else {
                     package_entries.push(IndexedEntry {
                         original_name: entry_path,
@@ -800,5 +807,49 @@ mod tests {
                 .flash_partitions(Vec::new(), RebootMode::None)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn test_scan_tar_packages_corrupt_manifest_fails() {
+        let temp_dir = std::env::temp_dir().join("samloader_test_tar_corrupt_manifest");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let tar_path = temp_dir.join("corrupt_manifest.tar");
+
+        {
+            let tar_file = File::create(&tar_path).unwrap();
+            let mut builder = tar::Builder::new(tar_file);
+
+            // Add meta-data/download-list.txt with invalid UTF-8 bytes
+            let mut header = tar::Header::new_gnu();
+            let corrupt_content = [0xFF, 0xFE, 0xFD];
+            header.set_size(corrupt_content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(
+                    &mut header,
+                    "meta-data/download-list.txt",
+                    &corrupt_content[..],
+                )
+                .unwrap();
+
+            builder.finish().unwrap();
+        }
+
+        let backend = Box::new(MockBackend::new(false));
+        let mut connection = OdinConnection::new(backend);
+        connection.init().unwrap();
+        let mut session = connection.begin_session().unwrap();
+
+        let tar_file = File::open(&tar_path).unwrap();
+        let opened_packages = vec![(tar_path.to_string_lossy().to_string(), tar_file)];
+
+        let mut manager = FlashManager::new(&mut session);
+        let result = manager.scan_tar_packages(&opened_packages);
+
+        assert!(matches!(result, Err(FlashError::ArchiveCorrupted(_, _))));
+
+        let _ = std::fs::remove_file(tar_path);
+        let _ = std::fs::remove_dir(temp_dir);
     }
 }
