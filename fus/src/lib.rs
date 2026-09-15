@@ -23,7 +23,7 @@ mod error;
 mod fusclient;
 mod xml;
 
-pub use download::{DownloadProgress, download_firmware};
+pub use download::{DownloadOptions, DownloadProgress, download_firmware};
 pub use error::{Error, Result};
 pub use fusclient::{Aes128EcbDec, FusClient};
 pub use xml::{BinaryInform, VersionInfo};

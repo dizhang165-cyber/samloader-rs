@@ -84,6 +84,7 @@ const VERSION_HELP: &str =
 const THREADS_HELP: &str = "Number of parallel connections";
 const OUT_DIR_HELP: &str = "Output directory";
 const OUT_FILE_HELP: &str = "Output file path";
+const FORCE_HELP: &str = "Overwrite existing files and discard any partial download";
 
 // --- Check Update Command (`check-update`) ---
 const ALL_HELP: &str =
@@ -251,6 +252,13 @@ fn main() {
                         .short('o')
                         .long("out-file")
                         .help(OUT_FILE_HELP),
+                )
+                .arg(
+                    Arg::new("force")
+                        .short('f')
+                        .long("force")
+                        .action(ArgAction::SetTrue)
+                        .help(FORCE_HELP),
                 ),
         )
         .subcommand(
@@ -435,6 +443,7 @@ fn main() {
             let threads = *sub_m.get_one::<u64>("threads").unwrap();
             let out_dir = sub_m.get_one::<String>("out_dir").cloned();
             let out_file = sub_m.get_one::<String>("out_file").cloned();
+            let force = sub_m.get_flag("force");
             let args = download::DownloadArgs {
                 model,
                 region,
@@ -442,6 +451,7 @@ fn main() {
                 threads,
                 out_dir,
                 out_file,
+                force,
                 verbose,
             };
             download::action_download(args);

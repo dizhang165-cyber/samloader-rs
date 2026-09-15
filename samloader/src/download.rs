@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use indicatif::{ProgressBar, ProgressStyle};
-use samloader_fus::{DownloadProgress, FusClient, download_firmware, fetch_version_xml};
+use samloader_fus::{
+    DownloadOptions, DownloadProgress, FusClient, download_firmware, fetch_version_xml,
+};
 use std::time::Duration;
 
 const PROGRESS_TEMPLATE: &str =
@@ -38,6 +40,9 @@ pub(crate) struct DownloadArgs {
     /// Optional: the output file name
     pub(crate) out_file: Option<String>,
 
+    /// Overwrite existing files and discard any partial download
+    pub(crate) force: bool,
+
     /// Whether to enable verbose output
     pub(crate) verbose: bool,
 }
@@ -50,6 +55,10 @@ struct ProgressWrapper<'a> {
 impl DownloadProgress for ProgressWrapper<'_> {
     fn set_length(&self, len: u64) {
         self.progress_bar.set_length(len);
+    }
+
+    fn set_position(&self, pos: u64) {
+        self.progress_bar.set_position(pos);
     }
 
     fn inc(&self, bytes: u64) {
@@ -113,7 +122,12 @@ pub(crate) fn action_download(args: DownloadArgs) {
         verbose: args.verbose,
     };
 
-    if let Err(e) = download_firmware(&client, &final_out, args.threads, &wrapper) {
+    let options = DownloadOptions {
+        threads: args.threads,
+        force: args.force,
+    };
+
+    if let Err(e) = download_firmware(&client, &final_out, options, &wrapper) {
         progress.abandon();
         eprintln!("\nERROR: Download failed: {e}");
         std::process::exit(1);

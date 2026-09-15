@@ -12,25 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Multi-threaded firmware download mechanism.
+//! Multi-threaded firmware download mechanism with embedded resumable state.
 
 use crate::FusClient;
 use crate::error::Result;
 use aes::cipher::BlockModeDecrypt;
 use aes::cipher::inout::InOutBuf;
+use fast_md5::Md5;
 use memmap2::MmapMut;
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
+/// The chunk size of each independently tracked download block (2 MiB).
+/// 2 MiB = 2,097,152 bytes = 131,072 AES-128 blocks (aligned to 16 bytes).
+const BLOCK_SIZE: usize = 2 * 1024 * 1024;
+
+/// Magic identifier placed at the trailing 8 bytes of the footer.
+const FOOTER_MAGIC: &[u8; 8] = b"SAMLOADR";
+
+/// Version of the footer layout format.
+const FOOTER_VERSION: u32 = 1;
+
+/// Length of the fixed trailing trailer: 16 (MD5) + 4 (footer_len) + 8 (magic) = 28 bytes.
+const TRAILER_LEN: usize = 28;
+
 /// A trait for reporting firmware download progress and logging messages.
 pub trait DownloadProgress: Send + Sync {
     /// Sets the total length of the progress.
     fn set_length(&self, len: u64);
+
+    /// Sets the current progress position (e.g. when resuming a partial download).
+    fn set_position(&self, pos: u64);
 
     /// Increments the download progress by the specified number of bytes.
     fn inc(&self, bytes: u64);
@@ -48,6 +65,7 @@ pub trait DownloadProgress: Send + Sync {
 // Convenient no-op implementation for silent downloads (e.g. in tests)
 impl DownloadProgress for () {
     fn set_length(&self, _len: u64) {}
+    fn set_position(&self, _pos: u64) {}
     fn inc(&self, _bytes: u64) {}
     fn position(&self) -> u64 {
         0
@@ -56,160 +74,564 @@ impl DownloadProgress for () {
     fn println_verbose(&self, _msg: &str) {}
 }
 
+/// Options controlling firmware download behavior.
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadOptions {
+    /// Number of parallel download connections.
+    pub threads: u64,
+    /// Overwrite any existing file or partial download from scratch.
+    pub force: bool,
+}
+
+impl Default for DownloadOptions {
+    fn default() -> Self {
+        Self {
+            threads: 8,
+            force: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ByteRange {
+    start: u64,
+    end: u64, // exclusive
+}
+
+struct FooterLayout {
+    num_blocks: usize,
+    bitfield_offset: usize,
+    bitfield_len: usize,
+    footer_len: usize,
+}
+
+impl FooterLayout {
+    fn new(client: &FusClient) -> Self {
+        let num_blocks = client.info.size.div_ceil(BLOCK_SIZE as u64) as usize;
+        let bitfield_len = num_blocks.div_ceil(8);
+        let bitfield_offset = 4 // version
+            + 8 // file_size
+            + 16 // key
+            + 4 // block_size
+            + 4 // num_blocks
+            + 2 // filename_len
+            + client.info.filename.len()
+            + 2 // version_len
+            + client.info.version.len();
+        let footer_len = bitfield_offset + bitfield_len + TRAILER_LEN;
+
+        Self {
+            num_blocks,
+            bitfield_offset,
+            bitfield_len,
+            footer_len,
+        }
+    }
+
+    fn serialize_initial(&self, client: &FusClient, out: &mut [u8]) {
+        assert_eq!(out.len(), self.footer_len);
+        let mut cursor = 0;
+
+        out[cursor..cursor + 4].copy_from_slice(&FOOTER_VERSION.to_le_bytes());
+        cursor += 4;
+        out[cursor..cursor + 8].copy_from_slice(&client.info.size.to_le_bytes());
+        cursor += 8;
+        out[cursor..cursor + 16].copy_from_slice(client.info.key.as_slice());
+        cursor += 16;
+        out[cursor..cursor + 4].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
+        cursor += 4;
+        out[cursor..cursor + 4].copy_from_slice(&(self.num_blocks as u32).to_le_bytes());
+        cursor += 4;
+
+        let fn_bytes = client.info.filename.as_bytes();
+        out[cursor..cursor + 2].copy_from_slice(&(fn_bytes.len() as u16).to_le_bytes());
+        cursor += 2;
+        out[cursor..cursor + fn_bytes.len()].copy_from_slice(fn_bytes);
+        cursor += fn_bytes.len();
+
+        let ver_bytes = client.info.version.as_bytes();
+        out[cursor..cursor + 2].copy_from_slice(&(ver_bytes.len() as u16).to_le_bytes());
+        cursor += 2;
+        out[cursor..cursor + ver_bytes.len()].copy_from_slice(ver_bytes);
+        cursor += ver_bytes.len();
+
+        // Zero out bitfield initially
+        out[cursor..cursor + self.bitfield_len].fill(0);
+        cursor += self.bitfield_len;
+
+        // Checksum over header + bitfield
+        let checksum = fast_md5::digest(&out[..cursor]);
+        out[cursor..cursor + 16].copy_from_slice(&checksum);
+        cursor += 16;
+
+        out[cursor..cursor + 4].copy_from_slice(&(self.footer_len as u32).to_le_bytes());
+        cursor += 4;
+        out[cursor..cursor + 8].copy_from_slice(FOOTER_MAGIC);
+        cursor += 8;
+
+        assert_eq!(cursor, out.len());
+    }
+}
+
+struct ParsedFooter {
+    bitfield: Vec<u8>,
+    num_blocks: usize,
+}
+
+impl ParsedFooter {
+    fn read_and_validate<R: Read + Seek>(reader: &mut R, client: &FusClient) -> Option<Self> {
+        let file_len = reader.seek(SeekFrom::End(0)).ok()?;
+        if file_len < TRAILER_LEN as u64 {
+            return None;
+        }
+
+        // Read trailing 12 bytes: footer_len (4) + magic (8)
+        reader.seek(SeekFrom::End(-12)).ok()?;
+        let mut tail = [0u8; 12];
+        reader.read_exact(&mut tail).ok()?;
+        let (footer_len_bytes, magic_bytes) = tail.split_at(4);
+        if magic_bytes != FOOTER_MAGIC {
+            return None;
+        }
+        let footer_len = u32::from_le_bytes(footer_len_bytes.try_into().unwrap()) as usize;
+        if footer_len < TRAILER_LEN || footer_len as u64 > file_len {
+            return None;
+        }
+
+        if file_len != client.info.size + footer_len as u64 {
+            return None;
+        }
+
+        // Read entire footer
+        reader.seek(SeekFrom::End(-(footer_len as i64))).ok()?;
+        let mut footer_bytes = vec![0u8; footer_len];
+        reader.read_exact(&mut footer_bytes).ok()?;
+
+        let payload_len = footer_len - TRAILER_LEN;
+
+        // Parse header fields
+        let mut cursor = 0;
+        let version = u32::from_le_bytes(footer_bytes.get(cursor..cursor + 4)?.try_into().ok()?);
+        cursor += 4;
+        if version != FOOTER_VERSION {
+            return None;
+        }
+
+        let file_size = u64::from_le_bytes(footer_bytes.get(cursor..cursor + 8)?.try_into().ok()?);
+        cursor += 8;
+        if file_size != client.info.size {
+            return None;
+        }
+
+        let key = footer_bytes.get(cursor..cursor + 16)?;
+        cursor += 16;
+        if key != client.info.key.as_slice() {
+            return None;
+        }
+
+        let block_size = u32::from_le_bytes(footer_bytes.get(cursor..cursor + 4)?.try_into().ok()?);
+        cursor += 4;
+        if block_size != BLOCK_SIZE as u32 {
+            return None;
+        }
+
+        let num_blocks = u32::from_le_bytes(footer_bytes.get(cursor..cursor + 4)?.try_into().ok()?);
+        cursor += 4;
+        let expected_num_blocks = client.info.size.div_ceil(BLOCK_SIZE as u64) as u32;
+        if num_blocks != expected_num_blocks {
+            return None;
+        }
+
+        let fn_len =
+            u16::from_le_bytes(footer_bytes.get(cursor..cursor + 2)?.try_into().ok()?) as usize;
+        cursor += 2;
+        let filename = std::str::from_utf8(footer_bytes.get(cursor..cursor + fn_len)?).ok()?;
+        cursor += fn_len;
+        if filename != client.info.filename {
+            return None;
+        }
+
+        let ver_len =
+            u16::from_le_bytes(footer_bytes.get(cursor..cursor + 2)?.try_into().ok()?) as usize;
+        cursor += 2;
+        let ver_str = std::str::from_utf8(footer_bytes.get(cursor..cursor + ver_len)?).ok()?;
+        cursor += ver_len;
+        if ver_str != client.info.version {
+            return None;
+        }
+
+        let bitfield_offset = cursor;
+        let bitfield_len = (num_blocks as usize).div_ceil(8);
+        if bitfield_offset + bitfield_len != payload_len {
+            return None;
+        }
+
+        // Verify checksum assuming all bitfields are zero
+        let mut hasher = Md5::new();
+        hasher.update(&footer_bytes[..bitfield_offset]);
+        const ZERO_CHUNK: [u8; 1024] = [0u8; 1024];
+        let mut remaining = bitfield_len;
+        while remaining > 0 {
+            let chunk_len = remaining.min(ZERO_CHUNK.len());
+            hasher.update(&ZERO_CHUNK[..chunk_len]);
+            remaining -= chunk_len;
+        }
+        let expected_checksum = hasher.finalize();
+        let stored_checksum = &footer_bytes[payload_len..payload_len + 16];
+        if expected_checksum.as_slice() != stored_checksum {
+            return None;
+        }
+
+        let bitfield = footer_bytes
+            .get(bitfield_offset..bitfield_offset + bitfield_len)?
+            .to_vec();
+
+        Some(Self {
+            bitfield,
+            num_blocks: num_blocks as usize,
+        })
+    }
+}
+
+fn calculate_completed_bytes(bitfield: &[u8], num_blocks: usize, total_size: u64) -> u64 {
+    let mut total = 0_u64;
+    for blk in 0..num_blocks {
+        if (bitfield[blk / 8] & (1 << (blk % 8))) != 0 {
+            let blk_size = if blk == num_blocks - 1 {
+                total_size - (blk as u64 * BLOCK_SIZE as u64)
+            } else {
+                BLOCK_SIZE as u64
+            };
+            total += blk_size;
+        }
+    }
+    total
+}
+
+fn extract_uncompleted_ranges(
+    bitfield: &[u8],
+    num_blocks: usize,
+    total_size: u64,
+) -> Vec<ByteRange> {
+    let mut ranges = Vec::new();
+    let mut run_start: Option<usize> = None;
+
+    for blk in 0..num_blocks {
+        let is_done = (bitfield[blk / 8] & (1 << (blk % 8))) != 0;
+        if !is_done {
+            if run_start.is_none() {
+                run_start = Some(blk);
+            }
+        } else if let Some(start_blk) = run_start.take() {
+            let start = start_blk as u64 * BLOCK_SIZE as u64;
+            let end = blk as u64 * BLOCK_SIZE as u64;
+            ranges.push(ByteRange { start, end });
+        }
+    }
+    if let Some(start_blk) = run_start.take() {
+        let start = start_blk as u64 * BLOCK_SIZE as u64;
+        let end = total_size;
+        ranges.push(ByteRange { start, end });
+    }
+    ranges
+}
+
+fn partition_ranges_for_threads(ranges: &[ByteRange], threads: u64) -> Vec<ByteRange> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    let total_remaining: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+    let target_chunk = (total_remaining / threads / BLOCK_SIZE as u64).max(1) * BLOCK_SIZE as u64;
+
+    let mut result = Vec::new();
+    for r in ranges {
+        let mut curr = r.start;
+        while r.end - curr > target_chunk {
+            result.push(ByteRange {
+                start: curr,
+                end: curr + target_chunk,
+            });
+            curr += target_chunk;
+        }
+        if curr < r.end {
+            result.push(ByteRange {
+                start: curr,
+                end: r.end,
+            });
+        }
+    }
+    result
+}
+
+struct StateTracker<'a> {
+    footer: &'a mut [u8],
+    bitfield_offset: usize,
+    total_blocks: usize,
+    file_size: u64,
+}
+
+impl<'a> StateTracker<'a> {
+    fn new(
+        footer: &'a mut [u8],
+        bitfield_offset: usize,
+        total_blocks: usize,
+        file_size: u64,
+    ) -> Self {
+        Self {
+            footer,
+            bitfield_offset,
+            total_blocks,
+            file_size,
+        }
+    }
+
+    fn on_bytes_decrypted(&mut self, start: u64, prev_dec: usize, new_dec: usize) {
+        let prev_pos = start + prev_dec as u64;
+        let curr_pos = start + new_dec as u64;
+        let start_blk = (prev_pos / BLOCK_SIZE as u64) as usize;
+        let end_blk = (curr_pos / BLOCK_SIZE as u64) as usize;
+
+        for blk in start_blk..=end_blk {
+            if blk >= self.total_blocks {
+                break;
+            }
+            let blk_end = if blk == self.total_blocks - 1 {
+                self.file_size
+            } else {
+                (blk + 1) as u64 * BLOCK_SIZE as u64
+            };
+            if curr_pos >= blk_end {
+                let byte_idx = self.bitfield_offset + blk / 8;
+                let bit_mask = 1 << (blk % 8);
+                self.footer[byte_idx] |= bit_mask;
+            }
+        }
+    }
+}
+
 /// Downloads the firmware binary in parallel across multiple threads, decrypting it in place,
-/// and writing to the file at `path`.
+/// supporting interruption and resumption via an embedded `.part` footer.
 pub fn download_firmware<P, PathRef>(
     client: &FusClient,
     path: PathRef,
-    threads: u64,
+    options: DownloadOptions,
     progress: &P,
 ) -> Result<()>
 where
     P: DownloadProgress,
     PathRef: AsRef<Path>,
 {
-    let file = OpenOptions::new()
+    let final_path = path.as_ref();
+    if let Some(parent) = final_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let part_path = {
+        let mut s = final_path.as_os_str().to_owned();
+        s.push(".part");
+        std::path::PathBuf::from(s)
+    };
+
+    if options.force {
+        let _ = std::fs::remove_file(final_path);
+        let _ = std::fs::remove_file(&part_path);
+    } else if let Ok(meta) = final_path.metadata() {
+        let len = meta.len();
+        if (client.info.size.saturating_sub(16)..=client.info.size).contains(&len) {
+            progress.println(&format!(
+                "File already exists and is complete: {}",
+                final_path.display()
+            ));
+            return Ok(());
+        }
+    }
+
+    let layout = FooterLayout::new(client);
+    let total_file_len = client.info.size + layout.footer_len as u64;
+
+    // Check if a valid partial download already exists
+    let had_existing_part = part_path.exists();
+    let existing_footer = if had_existing_part && !options.force {
+        if let Ok(mut f) = OpenOptions::new().read(true).open(&part_path) {
+            ParsedFooter::read_and_validate(&mut f, client)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .truncate(true)
-        .open(path)?;
+        .truncate(existing_footer.is_none())
+        .open(&part_path)?;
 
-    // Pre-allocate file
-    file.set_len(client.info.size)?;
+    let uncompleted = if let Some(ref pf) = existing_footer {
+        let completed_bytes =
+            calculate_completed_bytes(&pf.bitfield, pf.num_blocks, client.info.size);
+        progress.println(&format!(
+            "Resuming download: {:.2} GiB / {:.2} GiB ({:.1}%) already downloaded",
+            completed_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            client.info.size as f64 / (1024.0 * 1024.0 * 1024.0),
+            (completed_bytes as f64 / client.info.size as f64) * 100.0
+        ));
+        progress.set_length(client.info.size);
+        progress.set_position(completed_bytes);
+        extract_uncompleted_ranges(&pf.bitfield, pf.num_blocks, client.info.size)
+    } else {
+        if had_existing_part && !options.force {
+            progress.println(
+                "Existing partial download is incompatible or corrupted, restarting from scratch...",
+            );
+        }
+        file.set_len(total_file_len)?;
+        let mut initial_footer = vec![0u8; layout.footer_len];
+        layout.serialize_initial(client, &mut initial_footer);
+        file.seek(SeekFrom::Start(client.info.size))?;
+        file.write_all(&initial_footer)?;
+        file.sync_data()?;
+
+        progress.set_length(client.info.size);
+        progress.set_position(0);
+        vec![ByteRange {
+            start: 0,
+            end: client.info.size,
+        }]
+    };
 
     let mut map = unsafe { MmapMut::map_mut(&file)? };
 
-    client.init_download()?;
+    let download_chunks = partition_ranges_for_threads(&uncompleted, options.threads);
 
-    progress.set_length(client.info.size);
+    if !download_chunks.is_empty() {
+        client.init_download()?;
 
-    // Round up to the nearest 16 byte boundary
-    let chunk_size = (client.info.size / threads / 16 + 1) * 16;
+        let (payload_map, footer_map) = map.split_at_mut(client.info.size as usize);
 
-    let mut queue = VecDeque::new();
-    {
-        let mut chunks = map.chunks_mut(chunk_size as usize).enumerate().peekable();
-        while let Some((i, buf)) = chunks.next() {
-            let is_last = chunks.peek().is_none();
+        let tracker = Mutex::new(StateTracker::new(
+            footer_map,
+            layout.bitfield_offset,
+            layout.num_blocks,
+            client.info.size,
+        ));
 
-            let start = i as u64 * chunk_size;
-            // Ensure the last range covers the remainder of the file
-            let end = if is_last {
-                None
-            } else {
-                Some(start + chunk_size - 1)
-            };
+        let mut queue = VecDeque::new();
+        {
+            let mut rest = payload_map;
+            let mut current_offset = 0_u64;
 
-            queue.push_back(Chunk { buf, start, end });
+            for range in &download_chunks {
+                let skip = (range.start - current_offset) as usize;
+                let (_, tail) = rest.split_at_mut(skip);
+                let len = (range.end - range.start) as usize;
+                let (buf, next_rest) = tail.split_at_mut(len);
+                current_offset = range.end;
+                rest = next_rest;
+
+                queue.push_back(Chunk {
+                    buf,
+                    start: range.start,
+                    end: if range.end == client.info.size {
+                        None
+                    } else {
+                        Some(range.end - 1)
+                    },
+                });
+            }
+        }
+
+        let n_workers = queue.len().min(options.threads as usize);
+        let pool = Pool {
+            inner: Mutex::new(PoolInner {
+                queue,
+                in_flight: 0,
+                live: n_workers,
+                error: None,
+            }),
+            available: Condvar::new(),
+        };
+
+        thread::scope(|s| {
+            let pool = &pool;
+            let tracker = &tracker;
+            for _ in 0..n_workers {
+                s.spawn(move || run_worker(pool, client, progress, tracker));
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        let pool_error = pool.inner.lock().unwrap().error.take();
+        drop(pool);
+
+        if let Some(err) = pool_error {
+            map.flush()?;
+            return Err(err);
         }
     }
 
-    // Never spawn more connections than there are ranges to download.
-    let n_workers = queue.len().min(threads as usize);
-    let pool = Pool {
-        inner: Mutex::new(PoolInner {
-            queue,
-            in_flight: 0,
-            live: n_workers,
-            error: None,
-        }),
-        available: Condvar::new(),
-    };
-
-    thread::scope(|s| {
-        let pool = &pool;
-        for _ in 0..n_workers {
-            s.spawn(move || run_worker(pool, client, progress));
-
-            // Stagger connection setup to avoid hammering the server
-            thread::sleep(Duration::from_millis(100));
-        }
-    });
-
-    // The pool still borrows `map` through its (now-drained) work queue; drop it
-    // before reading back from the mapping.
-    drop(pool);
-
-    let last_byte = map.last().copied().unwrap_or(0);
+    // All blocks complete: read last byte to check PKCS#7 padding
+    let last_byte = map[client.info.size as usize - 1];
     map.flush()?;
     drop(map);
 
-    // Handle padding removal if needed
-    if last_byte > 0 && last_byte <= 16 {
-        let file_len = file.metadata().map(|m| m.len()).unwrap_or(client.info.size);
-        file.set_len(file_len - last_byte as u64)?;
+    let padding = if last_byte > 0 && last_byte <= 16 {
+        last_byte as u64
+    } else {
+        0
+    };
+    let final_len = client.info.size - padding;
+    file.set_len(final_len)?;
+    drop(file);
+
+    if final_path.exists() {
+        let _ = std::fs::remove_file(final_path);
     }
+    std::fs::rename(&part_path, final_path)?;
 
     Ok(())
 }
 
-/// A contiguous, not-yet-downloaded byte range mapped onto its slice of the
-/// output file. `buf` is exactly the destination for `[start, end]` (or
-/// `[start, EOF]` when `end` is `None`).
 struct Chunk<'a> {
     buf: &'a mut [u8],
     start: u64,
     end: Option<u64>,
 }
 
-/// Shared, work-stealing pool of outstanding ranges.
 struct Pool<'a> {
     inner: Mutex<PoolInner<'a>>,
     available: Condvar,
 }
 
 struct PoolInner<'a> {
-    /// Ranges waiting to be downloaded.
     queue: VecDeque<Chunk<'a>>,
-    /// Ranges currently being downloaded by some worker. While this is non-zero
-    /// more work may still be handed back, so an idle worker must wait rather
-    /// than conclude the download is finished.
     in_flight: usize,
-    /// Number of worker threads still running. A throttled worker only sheds
-    /// itself while this is `> 1`, so at least one connection always remains to
-    /// carry the download to completion.
     live: usize,
-    /// Holds the first fatal error occurred
     error: Option<crate::Error>,
 }
 
 enum ChunkOutcome {
-    /// The whole range was downloaded and decrypted.
     Done,
-    /// The connection stalled. `decrypted` bytes (a multiple of 16) of the range
-    /// are complete; everything after that still needs downloading.
     Stalled { decrypted: usize },
 }
 
-/// Consecutive *no-progress* attempts tolerated on a single connection before it
-/// is treated as throttled. The counter resets the moment a read advances the
-/// decrypted offset, so this bounds a stall (repeated retries that keep failing
-/// at the same offset) rather than the total number of blips over a long
-/// download. A genuinely slow-but-alive connection delivers *some* bytes within
-/// each timeout window and so never trips this.
 const MAX_STALL_RETRIES: u32 = 4;
-
-/// When only one connection is left, how many stalls in a row — with no overall
-/// progress in between — to tolerate before declaring the server dead and
-/// aborting, instead of retrying forever.
 const MAX_DEAD_STALLS: u32 = 4;
 
-/// A single download connection.
-fn run_worker(pool: &Pool<'_>, client: &FusClient, progress: &impl DownloadProgress) {
-    // For the final surviving connection only: how many times in a row the whole
-    // download failed to advance. Lets us give up on a truly dead server instead
-    // of spinning forever once we can no longer shed connections.
+fn run_worker(
+    pool: &Pool<'_>,
+    client: &FusClient,
+    progress: &impl DownloadProgress,
+    tracker: &Mutex<StateTracker<'_>>,
+) {
     let mut last_progress = 0_u64;
     let mut dead_stalls = 0_u32;
 
     loop {
-        // Take the next range, or wait until a throttled peer hands one back.
-        // When the queue is empty and nothing is in flight, every byte is in.
         let chunk = {
             let mut state = pool.inner.lock().unwrap();
             loop {
-                // If another thread set a fatal error, exit cooperatively.
                 if state.error.is_some() {
                     state.live -= 1;
                     pool.available.notify_all();
@@ -228,22 +650,23 @@ fn run_worker(pool: &Pool<'_>, client: &FusClient, progress: &impl DownloadProgr
             }
         };
 
-        let outcome = download_chunk(client, &mut chunk.buf[..], chunk.start, chunk.end, progress);
+        let outcome = download_chunk(
+            client,
+            &mut chunk.buf[..],
+            chunk.start,
+            chunk.end,
+            progress,
+            tracker,
+        );
 
         match outcome {
             ChunkOutcome::Done => {
                 dead_stalls = 0;
                 let mut state = pool.inner.lock().unwrap();
                 state.in_flight -= 1;
-                // A completion can be the event that drains the pool; wake idle
-                // peers so they can observe it and exit.
                 pool.available.notify_all();
             }
             ChunkOutcome::Stalled { decrypted } => {
-                // Split the range: keep the decrypted prefix (already in the
-                // file) and hand the rest back. ECB is position-independent, so
-                // whichever worker resumes this tail decrypts it correctly from a
-                // fresh decryptor at the 16-byte boundary `decrypted`.
                 let stall_off = chunk.start + decrypted as u64;
                 let Chunk { buf, end, .. } = chunk;
                 let (_done, rest) = buf.split_at_mut(decrypted);
@@ -255,7 +678,6 @@ fn run_worker(pool: &Pool<'_>, client: &FusClient, progress: &impl DownloadProgr
 
                 let mut state = pool.inner.lock().unwrap();
 
-                // If another thread already aborted with error, just exit!
                 if state.error.is_some() {
                     state.in_flight -= 1;
                     state.live -= 1;
@@ -267,9 +689,6 @@ fn run_worker(pool: &Pool<'_>, client: &FusClient, progress: &impl DownloadProgr
                 state.queue.push_back(remainder);
 
                 if state.live > 1 {
-                    // Other connections are still alive (and presumably making
-                    // progress); shed this throttled one and let them finish the
-                    // returned range.
                     state.live -= 1;
                     let remaining = state.live;
                     pool.available.notify_all();
@@ -281,9 +700,6 @@ fn run_worker(pool: &Pool<'_>, client: &FusClient, progress: &impl DownloadProgr
                     return;
                 }
 
-                // We are the last connection — shedding it would strand the
-                // download, so keep retrying. Bail out only if nothing at all
-                // comes through across several stall cycles.
                 pool.available.notify_all();
                 drop(state);
 
@@ -306,17 +722,16 @@ fn run_worker(pool: &Pool<'_>, client: &FusClient, progress: &impl DownloadProgr
     }
 }
 
-/// Download the byte range `[start, end]` (or `[start, EOF]` when `end` is
-/// `None`) into `chunk`, decrypting in place as bytes arrive.
 fn download_chunk(
     client: &FusClient,
     chunk: &mut [u8],
     start: u64,
     end: Option<u64>,
     progress: &impl DownloadProgress,
+    tracker: &Mutex<StateTracker<'_>>,
 ) -> ChunkOutcome {
     let mut dec = client.get_decryptor();
-    let mut dec_pos = 0_usize; // bytes decrypted so far (always a multiple of 16)
+    let mut dec_pos = 0_usize;
     let mut retries = 0_u32;
 
     loop {
@@ -336,18 +751,21 @@ fn download_chunk(
             }
         };
 
-        // We re-requested from `dec_pos`; discard the undecrypted tail and resume
-        // writing there. Progress only counts decrypted bytes, so the re-fetched
-        // overlap is never double-counted and there is nothing to roll back.
         let resume_from = dec_pos;
-        let mut dl_pos = dec_pos; // bytes received into `chunk` this connection
+        let mut dl_pos = dec_pos;
 
         let stall = loop {
             match resp.read(&mut chunk[dl_pos..]) {
-                Ok(0) => return ChunkOutcome::Done, // chunk fully received and decrypted
+                Ok(0) => {
+                    tracker
+                        .lock()
+                        .unwrap()
+                        .on_bytes_decrypted(start, resume_from, dec_pos);
+                    return ChunkOutcome::Done;
+                }
                 Ok(n) => dl_pos += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => break e, // connection dropped: resume the outer loop
+                Err(e) => break e,
             }
 
             let prev_dec = dec_pos;
@@ -355,15 +773,21 @@ fn download_chunk(
             dec.decrypt_blocks_inout(blocks);
             dec_pos = dl_pos - tail.len();
             progress.inc((dec_pos - prev_dec) as u64);
+
+            tracker
+                .lock()
+                .unwrap()
+                .on_bytes_decrypted(start, prev_dec, dec_pos);
         };
 
-        // Every byte is decrypted: the chunk is complete even though the
-        // connection broke before the server signaled EOF (`Ok(0)`). Return now
         if dec_pos == chunk.len() {
+            tracker
+                .lock()
+                .unwrap()
+                .on_bytes_decrypted(start, resume_from, dec_pos);
             return ChunkOutcome::Done;
         }
 
-        // Reset the budget only on real decryption progress (a whole new block),
         if dec_pos > resume_from {
             retries = 0;
         }
@@ -380,7 +804,201 @@ fn download_chunk(
     }
 }
 
-/// Exponential backoff capped at 30s: 1s, 2s, 4s, 8s, 16s, 30s, ...
 fn backoff(attempt: u32) -> Duration {
     Duration::from_secs((1u64 << (attempt - 1).min(5)).min(30))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xml::BinaryInform;
+    use std::io::Cursor;
+
+    fn make_test_client(size: u64) -> FusClient {
+        FusClient::new_mock(BinaryInform {
+            version: "S931U1UES1AXB2/S931U1OYM1AXB2/S931U1UES1AXB2/S931U1UES1AXB2".to_string(),
+            filename: "SM-S931U1_1_20240215120000_abcdefghij_fac.zip.enc4".to_string(),
+            path: "T1/SM-S931U1/XAA/".to_string(),
+            size,
+            key: vec![0x42; 16],
+            model_type: "SM-S931U1".to_string(),
+            region: "XAA".to_string(),
+        })
+    }
+
+    #[test]
+    fn test_footer_layout_and_serialization() {
+        let client = make_test_client(5 * 1024 * 1024); // 5 MiB -> 3 blocks (2 + 2 + 1)
+        let layout = FooterLayout::new(&client);
+        assert_eq!(layout.num_blocks, 3);
+        assert_eq!(layout.bitfield_len, 1);
+
+        let mut buf = vec![0u8; layout.footer_len];
+        layout.serialize_initial(&client, &mut buf);
+
+        let mut cursor = Cursor::new(vec![0u8; 5 * 1024 * 1024]);
+        cursor.seek(SeekFrom::End(0)).unwrap();
+        cursor.write_all(&buf).unwrap();
+
+        let parsed = ParsedFooter::read_and_validate(&mut cursor, &client)
+            .expect("Footer validation failed");
+        assert_eq!(parsed.num_blocks, 3);
+        assert_eq!(parsed.bitfield, vec![0]);
+    }
+
+    #[test]
+    fn test_footer_validation_failures() {
+        let client = make_test_client(4 * 1024 * 1024);
+        let layout = FooterLayout::new(&client);
+        let mut buf = vec![0u8; layout.footer_len];
+        layout.serialize_initial(&client, &mut buf);
+
+        // Tamper with magic
+        let mut tampered = buf.clone();
+        let len = tampered.len();
+        tampered[len - 1] ^= 0xFF;
+        let mut cursor = Cursor::new(vec![0u8; 4 * 1024 * 1024]);
+        cursor.write_all(&tampered).unwrap();
+        assert!(ParsedFooter::read_and_validate(&mut cursor, &client).is_none());
+
+        // Tamper with checksum
+        let mut tampered = buf.clone();
+        tampered[len - 20] ^= 0xFF;
+        let mut cursor = Cursor::new(vec![0u8; 4 * 1024 * 1024]);
+        cursor.write_all(&tampered).unwrap();
+        assert!(ParsedFooter::read_and_validate(&mut cursor, &client).is_none());
+
+        // Mismatched client info (e.g. different size)
+        let mut cursor = Cursor::new(vec![0u8; 4 * 1024 * 1024]);
+        cursor.write_all(&buf).unwrap();
+        let other_client = make_test_client(8 * 1024 * 1024);
+        assert!(ParsedFooter::read_and_validate(&mut cursor, &other_client).is_none());
+    }
+
+    #[test]
+    fn test_bitfield_and_range_extraction() {
+        // 5 blocks: block 0 (done), block 1 (not done), block 2 (done), block 3, 4 (not done)
+        let bitfield = vec![0b0000_0101]; // bit 0 and bit 2 set
+        let total_size = 5 * BLOCK_SIZE as u64;
+        let completed = calculate_completed_bytes(&bitfield, 5, total_size);
+        assert_eq!(completed, 2 * BLOCK_SIZE as u64);
+
+        let uncompleted = extract_uncompleted_ranges(&bitfield, 5, total_size);
+        assert_eq!(
+            uncompleted,
+            vec![
+                ByteRange {
+                    start: BLOCK_SIZE as u64,
+                    end: 2 * BLOCK_SIZE as u64,
+                },
+                ByteRange {
+                    start: 3 * BLOCK_SIZE as u64,
+                    end: 5 * BLOCK_SIZE as u64,
+                },
+            ]
+        );
+
+        let partitioned = partition_ranges_for_threads(&uncompleted, 4);
+        assert_eq!(partitioned.len(), 3);
+    }
+
+    #[test]
+    fn test_state_tracker_block_completion() {
+        let client = make_test_client(4 * 1024 * 1024); // 2 blocks
+        let layout = FooterLayout::new(&client);
+        let mut footer = vec![0u8; layout.footer_len];
+        layout.serialize_initial(&client, &mut footer);
+
+        {
+            let mut tracker = StateTracker::new(
+                &mut footer,
+                layout.bitfield_offset,
+                layout.num_blocks,
+                client.info.size,
+            );
+
+            // Decrypt first 1 MiB (not complete block yet)
+            tracker.on_bytes_decrypted(0, 0, 1024 * 1024);
+            assert_eq!(tracker.footer[layout.bitfield_offset], 0);
+
+            // Decrypt across 2 MiB boundary -> block 0 complete!
+            tracker.on_bytes_decrypted(0, 1024 * 1024, BLOCK_SIZE);
+            assert_eq!(tracker.footer[layout.bitfield_offset], 0b01);
+
+            // Complete block 1
+            tracker.on_bytes_decrypted(BLOCK_SIZE as u64, 0, BLOCK_SIZE);
+            assert_eq!(tracker.footer[layout.bitfield_offset], 0b11);
+        }
+
+        // Verify checksum is valid immediately after block completion
+        let mut cursor = Cursor::new(vec![0u8; 4 * 1024 * 1024]);
+        cursor.seek(SeekFrom::End(0)).unwrap();
+        cursor.write_all(&footer).unwrap();
+        let parsed = ParsedFooter::read_and_validate(&mut cursor, &client)
+            .expect("Footer must validate immediately after block completion");
+        assert_eq!(parsed.bitfield, vec![0b11]);
+    }
+
+    #[test]
+    fn test_abrupt_interruption_and_resume() {
+        let client = make_test_client(10 * 1024 * 1024); // 5 blocks
+        let layout = FooterLayout::new(&client);
+        let mut footer = vec![0u8; layout.footer_len];
+        layout.serialize_initial(&client, &mut footer);
+
+        // First run: completes block 0 and 1, then abruptly stops (no manual flush)
+        {
+            let mut tracker = StateTracker::new(
+                &mut footer,
+                layout.bitfield_offset,
+                layout.num_blocks,
+                client.info.size,
+            );
+            tracker.on_bytes_decrypted(0, 0, 2 * BLOCK_SIZE);
+        }
+
+        // Validate that footer is immediately valid and recognizes blocks 0 and 1
+        let mut cursor = Cursor::new(vec![0u8; 10 * 1024 * 1024]);
+        cursor.seek(SeekFrom::End(0)).unwrap();
+        cursor.write_all(&footer).unwrap();
+        let parsed = ParsedFooter::read_and_validate(&mut cursor, &client)
+            .expect("Must be valid immediately after abrupt interruption");
+        assert_eq!(parsed.bitfield[0] & 0b11, 0b11);
+        let uncompleted =
+            extract_uncompleted_ranges(&parsed.bitfield, parsed.num_blocks, client.info.size);
+        assert_eq!(
+            uncompleted,
+            vec![ByteRange {
+                start: 2 * BLOCK_SIZE as u64,
+                end: 10 * 1024 * 1024,
+            }]
+        );
+
+        // Second run: resumes and completes block 2 abruptly
+        {
+            let mut tracker = StateTracker::new(
+                &mut footer,
+                layout.bitfield_offset,
+                layout.num_blocks,
+                client.info.size,
+            );
+            tracker.on_bytes_decrypted(2 * BLOCK_SIZE as u64, 0, BLOCK_SIZE);
+        }
+
+        let mut cursor = Cursor::new(vec![0u8; 10 * 1024 * 1024]);
+        cursor.seek(SeekFrom::End(0)).unwrap();
+        cursor.write_all(&footer).unwrap();
+        let parsed2 = ParsedFooter::read_and_validate(&mut cursor, &client)
+            .expect("Must be valid after second resume");
+        assert_eq!(parsed2.bitfield[0] & 0b111, 0b111);
+        let uncompleted2 =
+            extract_uncompleted_ranges(&parsed2.bitfield, parsed2.num_blocks, client.info.size);
+        assert_eq!(
+            uncompleted2,
+            vec![ByteRange {
+                start: 3 * BLOCK_SIZE as u64,
+                end: 10 * 1024 * 1024,
+            }]
+        );
+    }
 }

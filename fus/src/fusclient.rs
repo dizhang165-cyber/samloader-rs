@@ -74,6 +74,16 @@ impl FusClient {
         Ok(fus)
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_mock(info: BinaryInform) -> Self {
+        Self {
+            client: Client::new(),
+            auth_state: Mutex::new(AuthState::default()),
+            reauth_gen: Mutex::new(0),
+            info,
+        }
+    }
+
     /// Queries the server for firmware binary metadata matching the requested model, region, and version.
     pub fn fetch_binary_info(&mut self, model: &str, region: &str, version: &str) {
         let mut parts: Vec<&str> = version.split('/').collect();
