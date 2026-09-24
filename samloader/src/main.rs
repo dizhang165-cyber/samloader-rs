@@ -122,10 +122,8 @@ Example auto-matching: samloader flash -f boot.img"#;
 
 const NO_REBOOT_HELP: &str = "Disables automatic reboot after flashing";
 const ERASE_HELP: &str = "Perform low-level NAND hardware erase on USERDATA before flashing";
-const REPARTITION_HELP: &str = "Repartition the device. WARNING: It's strongly recommended \
-                                you specify all files at your disposal";
 const SKIP_SIZE_CHECK_HELP: &str = "Do not verify that files fit in the specified partition";
-const PIT_HELP: &str = "The PIT file to use for repartitioning or flashing";
+const PIT_HELP: &str = "The PIT file to flash to the device";
 const SKIP_MD5_HELP: &str = "Skip MD5 checksum verification";
 const BL_HELP: &str = "BL tar package file";
 const AP_HELP: &str = "AP tar package file";
@@ -327,12 +325,6 @@ fn main() {
                         .long("erase")
                         .action(ArgAction::SetTrue)
                         .help(ERASE_HELP),
-                )
-                .arg(
-                    Arg::new("repartition")
-                        .long("repartition")
-                        .action(ArgAction::SetTrue)
-                        .help(REPARTITION_HELP),
                 )
                 .arg(
                     Arg::new("skip-size-check")
@@ -601,7 +593,6 @@ fn main() {
 
             let result = flash::action_flash(
                 usb_backend,
-                sub_matches.get_flag("repartition"),
                 verbose,
                 get_reboot_mode(sub_matches),
                 sub_matches.get_flag("wait"),

@@ -141,7 +141,6 @@ pub struct FlashManager<'a> {
     session: &'a mut OdinSession,
     pit_file_bytes: Option<Vec<u8>>,
 
-    repartition: bool,
     reboot_mode: RebootMode,
     skip_size_check: bool,
     skip_md5: bool,
@@ -160,7 +159,6 @@ impl<'a> FlashManager<'a> {
         Self {
             session,
             pit_file_bytes: None,
-            repartition: false,
             reboot_mode: RebootMode::None,
             skip_size_check: false,
             skip_md5: false,
@@ -184,12 +182,6 @@ impl<'a> FlashManager<'a> {
     /// Sets an optional 3-letter CSC / Sales Code to configure on the device.
     pub fn sales_code(mut self, sales_code: Option<&'a str>) -> Self {
         self.sales_code = sales_code;
-        self
-    }
-
-    /// Sets whether to perform repartitioning.
-    pub fn repartition(mut self, enabled: bool) -> Self {
-        self.repartition = enabled;
         self
     }
 
@@ -282,8 +274,8 @@ impl<'a> FlashManager<'a> {
         let opened_packages = self.open_and_verify_packages()?;
         let resolved_entries = self.scan_tar_packages(&opened_packages)?;
 
-        // Step 3: Handle repartitioning and download active PIT data from the device
-        let pit_data = self.download_and_parse_pit(self.repartition)?;
+        // Step 3: Flash PIT if available and download active PIT data from the device
+        let pit_data = self.download_and_parse_pit()?;
 
         // Step 4: Map entries and individual files to FirmwareInfo payloads
         let partition_infos = self.build_partition_infos(
@@ -472,20 +464,15 @@ impl<'a> FlashManager<'a> {
         Ok(resolved_entries)
     }
 
-    // Helper 3: Download and parse active PIT data
-    fn download_and_parse_pit(&mut self, repartition: bool) -> Result<PitData, FlashError> {
-        if repartition && self.pit_file_bytes.is_none() {
-            return Err(FlashError::RepartitionPitRequired);
-        }
-
+    // Helper 3: Flash PIT if available and download active PIT data
+    fn download_and_parse_pit(&mut self) -> Result<PitData, FlashError> {
         if self.erase {
             self.session.nand_erase()?;
         }
 
-        if repartition {
+        if let Some(pit_bytes) = &self.pit_file_bytes {
             progress::println("Flashing PIT");
-            self.session
-                .send_pit_info(self.pit_file_bytes.as_ref().unwrap())?;
+            self.session.send_pit_info(pit_bytes)?;
             progress::println("PIT flash successful\n");
         }
 
@@ -869,5 +856,26 @@ mod tests {
 
         let _ = std::fs::remove_file(tar_path);
         let _ = std::fs::remove_dir(temp_dir);
+    }
+
+    #[test]
+    fn test_download_and_parse_pit_flashes_available_pit() {
+        let backend = Box::new(MockBackend::new(false));
+        let mut connection = OdinConnection::new(backend);
+        connection.init().unwrap();
+        let mut session = connection.begin_session().unwrap();
+
+        let mut manager = FlashManager::new(&mut session);
+        manager.pit_file_bytes = Some(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/test-data/M3_EUR_OPEN_4G.pit"
+            ))
+            .to_vec(),
+        );
+
+        let pit_data = manager.download_and_parse_pit().unwrap();
+        // M3_EUR_OPEN_4G.pit has Mx-MDM, verifying PIT was sent and updated device state
+        assert_eq!(pit_data.cpu_bl_id.to_string_lossy(), "Mx-MDM");
     }
 }

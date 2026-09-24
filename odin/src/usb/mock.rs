@@ -562,16 +562,24 @@ impl UsbTransfer for MockBackend {
                     // Check if the buffer is a 1024-byte control packet or raw PIT binary
                     if self.incoming_buffer.len() >= 1024 {
                         let mut cursor = Cursor::new(&self.incoming_buffer[..1024]);
-                        if let Ok(Command::Pit(PitCommand::End { .. })) =
-                            Command::read_le(&mut cursor)
-                        {
-                            if !self.active_pit_data.is_empty() {
-                                self.parsed_pit = PitData::new(&self.active_pit_data).ok();
+                        if let Ok(cmd) = Command::read_le(&mut cursor) {
+                            match cmd {
+                                Command::Pit(PitCommand::Slice { .. }) => {
+                                    self.push_response(CMD_PIT, 0);
+                                    self.incoming_buffer.drain(..1024);
+                                    return true;
+                                }
+                                Command::Pit(PitCommand::End { .. }) => {
+                                    if !self.active_pit_data.is_empty() {
+                                        self.parsed_pit = PitData::new(&self.active_pit_data).ok();
+                                    }
+                                    self.state = State::SessionBegun;
+                                    self.push_response(CMD_PIT, 0);
+                                    self.incoming_buffer.drain(..1024);
+                                    return true;
+                                }
+                                _ => {}
                             }
-                            self.state = State::SessionBegun;
-                            self.push_response(CMD_PIT, 0);
-                            self.incoming_buffer.drain(..1024);
-                            return true;
                         }
                     }
 

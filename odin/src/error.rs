@@ -249,10 +249,6 @@ pub enum FlashError {
     #[error("Cross-archive consistency check failed! download-list.txt does not match.")]
     CrossArchiveInconsistency,
 
-    /// Partition re-allocation requires an explicit PIT file.
-    #[error("If you wish to repartition then a PIT file must be specified.")]
-    RepartitionPitRequired,
-
     /// Failed to unpack the device-specific PIT file.
     #[error("Failed to unpack device's PIT file: {0}")]
     PitUnpackFailed(#[source] binrw::Error),

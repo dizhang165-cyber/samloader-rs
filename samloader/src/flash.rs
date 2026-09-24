@@ -123,7 +123,6 @@ impl FlashProgress for CliProgress {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn action_flash(
     usb_backend: UsbBackendOption,
-    repartition: bool,
     verbose: bool,
     reboot_mode: RebootMode,
     wait: bool,
@@ -165,7 +164,6 @@ pub(crate) fn action_flash(
         .collect();
 
     let mut flash_manager = FlashManager::new(&mut session)
-        .repartition(repartition)
         .reboot_mode(reboot_mode)
         .skip_size_check(skip_size_check)
         .skip_md5(skip_md5)
