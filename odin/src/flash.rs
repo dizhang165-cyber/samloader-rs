@@ -18,6 +18,7 @@ use crate::FlashError;
 use crate::firmware::{
     FirmwareFile, FirmwareInfo, FirmwareLz4File, Lz4FrameHeader, verify_md5_footer,
 };
+use crate::lp::inspect_super_firmware_info;
 use crate::odin::OdinSession;
 use crate::progress::{self, FlashEvent};
 use memmap2::{Mmap, MmapOptions};
@@ -291,6 +292,23 @@ impl<'a> FlashManager<'a> {
             &self.partitions,
             self.skip_size_check,
         )?;
+
+        // Auto-detect super_used_size if not specified in TAR metadata
+        if self.super_used_size.is_none()
+            && let Some(super_info) = partition_infos.iter().find(|info| {
+                let entry = match info {
+                    FirmwareInfo::Normal(f) => f.pit_entry,
+                    FirmwareInfo::Lz4(f) => f.pit_entry,
+                };
+                entry.partition_name == "SUPER"
+                    || entry
+                        .flash_filename
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case("super.img")
+            })
+        {
+            self.super_used_size = inspect_super_firmware_info(super_info);
+        }
 
         // Step 5: Flash payloads to the device
         self.flash_partitions(partition_infos, self.reboot_mode)?;
@@ -616,7 +634,7 @@ impl<'a> FlashManager<'a> {
             && super_used_size > 0
             && self.session.bootloader_protocol_version() >= 3
         {
-            let check_size = if self.has_download_list {
+            let check_size = if self.has_download_list || self.packages.is_empty() {
                 super_used_size
             } else {
                 0

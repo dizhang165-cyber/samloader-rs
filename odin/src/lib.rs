@@ -20,6 +20,7 @@ mod device_info;
 mod error;
 mod firmware;
 mod flash;
+mod lp;
 mod odin;
 mod progress;
 mod protocol;
