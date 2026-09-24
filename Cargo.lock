@@ -1495,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "samloader"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "cfg-if",
  "clap",
@@ -1508,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "samloader-fus"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "aes",
  "ecb",
@@ -1521,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "samloader-odin"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "binrw",
  "fast-md5",
@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "samloader-pit"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "binrw",
  "modular-bitfield",
